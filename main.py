@@ -15,9 +15,8 @@ class StuntCVApp:
         self.cap = None
         self.playing = False
 
-        # Increase model complexity for better accuracy
         self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
         self.mp_drawing = mp.solutions.drawing_utils
 
         self.create_widgets()
@@ -50,64 +49,58 @@ class StuntCVApp:
         if self.playing:
             self.update_frame()
 
-    def draw_base_pose(self, frame, results):
-        # This function now only draws the primary detected person (the base).
-        # The flyer logic is commented out for future use.
-        if results and results.pose_landmarks:
-            base_color = (255, 0, 0)  # Blue in BGR
-            self.mp_drawing.draw_landmarks(
-                frame, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=base_color, thickness=2, circle_radius=2),
-                connection_drawing_spec=self.mp_drawing.DrawingSpec(color=base_color, thickness=2, circle_radius=2)
-            )
+    def classify_and_draw_base(self, frame, results1, results2):
+        poses = []
+        if results1 and results1.pose_landmarks:
+            poses.append(results1.pose_landmarks)
+        if results2 and results2.pose_landmarks:
+            poses.append(results2.pose_landmarks)
 
-    # def classify_and_draw_poses(self, frame, results1, results2):
-    #     poses = []
-    #     if results1 and results1.pose_landmarks:
-    #         poses.append(results1.pose_landmarks)
-    #     if results2 and results2.pose_landmarks:
-    #         poses.append(results2.pose_landmarks)
-    #
-    #     if len(poses) < 2:
-    #         for pose_landmarks in poses:
-    #             self.mp_drawing.draw_landmarks(frame, pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
-    #         return
-    #
-    #     avg_y = []
-    #     for pose_landmarks in poses:
-    #         y_coords = [lm.y for lm in pose_landmarks.landmark]
-    #         avg_y.append(sum(y_coords) / len(y_coords))
-    #
-    #     if avg_y[0] < avg_y[1]:
-    #         flyer_landmarks = poses[0]
-    #         base_landmarks = poses[1]
-    #     else:
-    #         flyer_landmarks = poses[1]
-    #         base_landmarks = poses[0]
-    #
-    #     flyer_color = (0, 0, 255)  # Red in BGR
-    #     base_color = (255, 0, 0)   # Blue in BGR
-    #
-    #     self.mp_drawing.draw_landmarks(
-    #         frame, flyer_landmarks, self.mp_pose.POSE_CONNECTIONS,
-    #         landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=flyer_color, thickness=2, circle_radius=2),
-    #         connection_drawing_spec=self.mp_drawing.DrawingSpec(color=flyer_color, thickness=2, circle_radius=2)
-    #     )
-    #     self.mp_drawing.draw_landmarks(
-    #         frame, base_landmarks, self.mp_pose.POSE_CONNECTIONS,
-    #         landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=base_color, thickness=2, circle_radius=2),
-    #         connection_drawing_spec=self.mp_drawing.DrawingSpec(color=base_color, thickness=2, circle_radius=2)
-    #     )
+        if not poses:
+            return
+
+        if len(poses) == 1:
+            base_landmarks = poses[0]
+        else:
+            avg_y = []
+            for pose_landmarks in poses:
+                y_coords = [lm.y for lm in pose_landmarks.landmark]
+                avg_y.append(sum(y_coords) / len(y_coords))
+
+            # The person with the higher average y-coordinate is lower in the frame, so they are the base.
+            if avg_y[0] > avg_y[1]:
+                base_landmarks = poses[0]
+            else:
+                base_landmarks = poses[1]
+
+        base_color = (255, 0, 0)   # Blue in BGR
+        self.mp_drawing.draw_landmarks(
+            frame, base_landmarks, self.mp_pose.POSE_CONNECTIONS,
+            landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=base_color, thickness=2, circle_radius=2),
+            connection_drawing_spec=self.mp_drawing.DrawingSpec(color=base_color, thickness=2, circle_radius=2)
+        )
 
     def update_frame(self):
         if self.playing and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = self.pose.process(frame_rgb)
+                
+                results1 = self.pose.process(frame_rgb)
+                results2 = None
 
-                # Simplified drawing for just the base
-                self.draw_base_pose(frame, results)
+                if results1.pose_landmarks:
+                    frame_rgb_copy = np.copy(frame_rgb)
+                    h, w, _ = frame_rgb_copy.shape
+                    landmarks = results1.pose_landmarks.landmark
+                    x_min = min([lm.x for lm in landmarks]) * w
+                    x_max = max([lm.x for lm in landmarks]) * w
+                    y_min = min([lm.y for lm in landmarks]) * h
+                    y_max = max([lm.y for lm in landmarks]) * h
+                    cv2.rectangle(frame_rgb_copy, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 0, 0), -1)
+                    results2 = self.pose.process(frame_rgb_copy)
+
+                self.classify_and_draw_base(frame, results1, results2)
 
                 self.photo = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
                 self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
@@ -133,10 +126,21 @@ class StuntCVApp:
                         break
 
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = self.pose.process(frame_rgb)
+                    results1 = self.pose.process(frame_rgb)
+                    results2 = None
 
-                    # Simplified drawing for just the base
-                    self.draw_base_pose(frame, results)
+                    if results1.pose_landmarks:
+                        frame_rgb_copy = np.copy(frame_rgb)
+                        h, w, _ = frame_rgb_copy.shape
+                        landmarks = results1.pose_landmarks.landmark
+                        x_min = min([lm.x for lm in landmarks]) * w
+                        x_max = max([lm.x for lm in landmarks]) * w
+                        y_min = min([lm.y for lm in landmarks]) * h
+                        y_max = max([lm.y for lm in landmarks]) * h
+                        cv2.rectangle(frame_rgb_copy, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 0, 0), -1)
+                        results2 = self.pose.process(frame_rgb_copy)
+
+                    self.classify_and_draw_base(frame, results1, results2)
                     out.write(frame)
 
                 cap.release()
