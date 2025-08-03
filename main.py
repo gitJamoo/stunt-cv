@@ -1,4 +1,3 @@
-
 import cv2
 import mediapipe as mp
 import tkinter as tk
@@ -9,11 +8,13 @@ import numpy as np
 class StuntCVApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Stunt CV")
+        self.root.title("Stunt CV - Triple View")
 
         self.video_path = None
         self.cap = None
         self.playing = False
+        self.video_width = 0
+        self.video_height = 0
 
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
@@ -22,8 +23,21 @@ class StuntCVApp:
         self.create_widgets()
 
     def create_widgets(self):
-        self.canvas = tk.Canvas(self.root, width=1280, height=720)
-        self.canvas.pack()
+        # Main frame for the video canvases
+        self.video_frame = tk.Frame(self.root)
+        self.video_frame.pack()
+
+        # Canvas for original video (left)
+        self.canvas_left = tk.Canvas(self.video_frame, width=480, height=270, bg='black')
+        self.canvas_left.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Canvas for video with pose overlay (middle)
+        self.canvas_middle = tk.Canvas(self.video_frame, width=480, height=270, bg='black')
+        self.canvas_middle.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Canvas for pose only (right)
+        self.canvas_right = tk.Canvas(self.video_frame, width=480, height=270, bg='black')
+        self.canvas_right.pack(side=tk.LEFT, padx=5, pady=5)
 
         self.btn_frame = tk.Frame(self.root)
         self.btn_frame.pack(pady=10)
@@ -41,6 +55,16 @@ class StuntCVApp:
         self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi")])
         if self.video_path:
             self.cap = cv2.VideoCapture(self.video_path)
+            self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Adjust canvas sizes to fit video aspect ratio
+            display_height = 360
+            display_width = int(self.video_width * (display_height / self.video_height))
+            
+            for canvas in [self.canvas_left, self.canvas_middle, self.canvas_right]:
+                canvas.config(width=display_width, height=display_height)
+
             self.playing = True
             self.update_frame()
 
@@ -67,7 +91,6 @@ class StuntCVApp:
                 y_coords = [lm.y for lm in pose_landmarks.landmark]
                 avg_y.append(sum(y_coords) / len(y_coords))
 
-            # The person with the higher average y-coordinate is lower in the frame, so they are the base.
             if avg_y[0] > avg_y[1]:
                 base_landmarks = poses[0]
             else:
@@ -84,8 +107,17 @@ class StuntCVApp:
         if self.playing and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # 1. Original Video (Left)
+                original_frame = frame.copy()
+
+                # 2. Pose Overlay Video (Middle)
+                overlay_frame = frame.copy()
                 
+                # 3. Pose-only Video (Right)
+                pose_only_frame = np.zeros_like(frame)
+
+                # Process frame for pose
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results1 = self.pose.process(frame_rgb)
                 results2 = None
 
@@ -100,10 +132,32 @@ class StuntCVApp:
                     cv2.rectangle(frame_rgb_copy, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 0, 0), -1)
                     results2 = self.pose.process(frame_rgb_copy)
 
-                self.classify_and_draw_base(frame, results1, results2)
+                # Draw poses on overlay and pose-only frames
+                self.classify_and_draw_base(overlay_frame, results1, results2)
+                self.classify_and_draw_base(pose_only_frame, results1, results2)
 
-                self.photo = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-                self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
+                # --- Display Frames ---
+                display_height = 360
+                display_width = int(self.video_width * (display_height / self.video_height))
+
+                # Left canvas
+                img_left = cv2.resize(original_frame, (display_width, display_height))
+                img_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2RGB)
+                self.photo_left = ImageTk.PhotoImage(image=Image.fromarray(img_left))
+                self.canvas_left.create_image(0, 0, image=self.photo_left, anchor=tk.NW)
+
+                # Middle canvas
+                img_middle = cv2.resize(overlay_frame, (display_width, display_height))
+                img_middle = cv2.cvtColor(img_middle, cv2.COLOR_BGR2RGB)
+                self.photo_middle = ImageTk.PhotoImage(image=Image.fromarray(img_middle))
+                self.canvas_middle.create_image(0, 0, image=self.photo_middle, anchor=tk.NW)
+
+                # Right canvas
+                img_right = cv2.resize(pose_only_frame, (display_width, display_height))
+                img_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2RGB)
+                self.photo_right = ImageTk.PhotoImage(image=Image.fromarray(img_right))
+                self.canvas_right.create_image(0, 0, image=self.photo_right, anchor=tk.NW)
+
                 self.root.after(10, self.update_frame)
             else:
                 self.cap.release()
@@ -113,6 +167,8 @@ class StuntCVApp:
         if self.video_path:
             save_path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
             if save_path:
+                # For now, saving the middle view (overlay). 
+                # This could be changed to save all three or let the user choose.
                 cap = cv2.VideoCapture(self.video_path)
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -125,6 +181,7 @@ class StuntCVApp:
                     if not ret:
                         break
 
+                    overlay_frame = frame.copy()
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     results1 = self.pose.process(frame_rgb)
                     results2 = None
@@ -140,8 +197,8 @@ class StuntCVApp:
                         cv2.rectangle(frame_rgb_copy, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 0, 0), -1)
                         results2 = self.pose.process(frame_rgb_copy)
 
-                    self.classify_and_draw_base(frame, results1, results2)
-                    out.write(frame)
+                    self.classify_and_draw_base(overlay_frame, results1, results2)
+                    out.write(overlay_frame)
 
                 cap.release()
                 out.release()
