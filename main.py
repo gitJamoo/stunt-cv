@@ -1,9 +1,17 @@
+
 import cv2
 import mediapipe as mp
 import tkinter as tk
 from tkinter import filedialog
 from PIL import Image, ImageTk
 import numpy as np
+from collections import deque
+from mediapipe.framework.formats import landmark_pb2
+
+# Helper class to hold smoothed landmarks, mimicking the structure of MediaPipe's results object.
+class SmoothedResults:
+    def __init__(self, landmarks):
+        self.pose_landmarks = landmarks
 
 class StuntCVApp:
     def __init__(self, root):
@@ -19,6 +27,12 @@ class StuntCVApp:
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
         self.mp_drawing = mp.solutions.drawing_utils
+
+        # --- Smoothing Parameters ---
+        self.smoothing_window = 5  # Number of frames to average over.
+        self.pose1_history = deque(maxlen=self.smoothing_window)
+        self.pose2_history = deque(maxlen=self.smoothing_window)
+        # --- End Smoothing Parameters ---
 
         self.create_widgets()
 
@@ -54,11 +68,14 @@ class StuntCVApp:
     def open_video(self):
         self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi")])
         if self.video_path:
+            # Reset history for new video
+            self.pose1_history.clear()
+            self.pose2_history.clear()
+            
             self.cap = cv2.VideoCapture(self.video_path)
             self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            # Adjust canvas sizes to fit video aspect ratio
             display_height = 360
             display_width = int(self.video_width * (display_height / self.video_height))
             
@@ -72,6 +89,36 @@ class StuntCVApp:
         self.playing = not self.playing
         if self.playing:
             self.update_frame()
+
+    def smooth_pose(self, results, history):
+        """Applies a simple moving average to the pose landmarks."""
+        if not results or not results.pose_landmarks:
+            # If no landmarks are detected, clear the history to avoid using old data.
+            history.clear()
+            return SmoothedResults(None)
+
+        # Add current landmarks to history
+        history.append(results.pose_landmarks.landmark)
+
+        # Create a new landmark list for the smoothed data
+        smoothed_landmark_list = landmark_pb2.NormalizedLandmarkList()
+        
+        num_landmarks = len(history[0])
+        for i in range(num_landmarks):
+            # Calculate the average position for each landmark across the history buffer
+            avg_x = sum(frame[i].x for frame in history) / len(history)
+            avg_y = sum(frame[i].y for frame in history) / len(history)
+            avg_z = sum(frame[i].z for frame in history) / len(history)
+            avg_vis = sum(frame[i].visibility for frame in history) / len(history)
+
+            # Add the new smoothed landmark to our list
+            landmark = smoothed_landmark_list.landmark.add()
+            landmark.x = avg_x
+            landmark.y = avg_y
+            landmark.z = avg_z
+            landmark.visibility = avg_vis
+        
+        return SmoothedResults(smoothed_landmark_list)
 
     def classify_and_draw_base(self, frame, results1, results2):
         poses = []
@@ -107,16 +154,10 @@ class StuntCVApp:
         if self.playing and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
-                # 1. Original Video (Left)
                 original_frame = frame.copy()
-
-                # 2. Pose Overlay Video (Middle)
                 overlay_frame = frame.copy()
-                
-                # 3. Pose-only Video (Right)
                 pose_only_frame = np.zeros_like(frame)
 
-                # Process frame for pose
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results1 = self.pose.process(frame_rgb)
                 results2 = None
@@ -132,27 +173,29 @@ class StuntCVApp:
                     cv2.rectangle(frame_rgb_copy, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 0, 0), -1)
                     results2 = self.pose.process(frame_rgb_copy)
 
-                # Draw poses on overlay and pose-only frames
-                self.classify_and_draw_base(overlay_frame, results1, results2)
-                self.classify_and_draw_base(pose_only_frame, results1, results2)
+                # --- Apply Smoothing ---
+                smoothed_results1 = self.smooth_pose(results1, self.pose1_history)
+                smoothed_results2 = self.smooth_pose(results2, self.pose2_history)
+                # --- End Smoothing ---
+
+                # Draw poses using smoothed data
+                self.classify_and_draw_base(overlay_frame, smoothed_results1, smoothed_results2)
+                self.classify_and_draw_base(pose_only_frame, smoothed_results1, smoothed_results2)
 
                 # --- Display Frames ---
                 display_height = 360
                 display_width = int(self.video_width * (display_height / self.video_height))
 
-                # Left canvas
                 img_left = cv2.resize(original_frame, (display_width, display_height))
                 img_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2RGB)
                 self.photo_left = ImageTk.PhotoImage(image=Image.fromarray(img_left))
                 self.canvas_left.create_image(0, 0, image=self.photo_left, anchor=tk.NW)
 
-                # Middle canvas
                 img_middle = cv2.resize(overlay_frame, (display_width, display_height))
                 img_middle = cv2.cvtColor(img_middle, cv2.COLOR_BGR2RGB)
                 self.photo_middle = ImageTk.PhotoImage(image=Image.fromarray(img_middle))
                 self.canvas_middle.create_image(0, 0, image=self.photo_middle, anchor=tk.NW)
 
-                # Right canvas
                 img_right = cv2.resize(pose_only_frame, (display_width, display_height))
                 img_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2RGB)
                 self.photo_right = ImageTk.PhotoImage(image=Image.fromarray(img_right))
@@ -167,14 +210,17 @@ class StuntCVApp:
         if self.video_path:
             save_path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
             if save_path:
-                # For now, saving the middle view (overlay). 
-                # This could be changed to save all three or let the user choose.
                 cap = cv2.VideoCapture(self.video_path)
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+
+                # --- Use separate history for saving process ---
+                save_pose1_history = deque(maxlen=self.smoothing_window)
+                save_pose2_history = deque(maxlen=self.smoothing_window)
+                # ---
 
                 while cap.isOpened():
                     ret, frame = cap.read()
@@ -197,7 +243,12 @@ class StuntCVApp:
                         cv2.rectangle(frame_rgb_copy, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 0, 0), -1)
                         results2 = self.pose.process(frame_rgb_copy)
 
-                    self.classify_and_draw_base(overlay_frame, results1, results2)
+                    # --- Apply Smoothing for saving ---
+                    smoothed_results1 = self.smooth_pose(results1, save_pose1_history)
+                    smoothed_results2 = self.smooth_pose(results2, save_pose2_history)
+                    # ---
+
+                    self.classify_and_draw_base(overlay_frame, smoothed_results1, smoothed_results2)
                     out.write(overlay_frame)
 
                 cap.release()

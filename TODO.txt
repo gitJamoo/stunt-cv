@@ -1,0 +1,4 @@
+1. Add flyer tracking (hard)
+2. Add CSV export
+3. Have CSV export go to an AI or something to compare and see where the issue is in stunting
+4. Market?
