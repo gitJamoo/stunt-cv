@@ -2,7 +2,7 @@
 import cv2
 import mediapipe as mp
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 from collections import deque
@@ -41,10 +41,11 @@ class StuntCVApp:
         self.track_flyer = tk.BooleanVar(value=True)
 
         # ROI State
-        self.base_roi =  {"x": 50,  "y": 180, "w": 150, "h": 180, "name": "base"}
-        self.flyer_roi =  {"x": 60,  "y": 190, "w": 150, "h": 180, "name": "base"}
+        self.base_roi =  {"x": 30,  "y": 110, "w": 150, "h": 180, "name": "base"}
+        self.flyer_roi = {"x": 30, "y": 15,  "w": 150, "h": 180, "name": "flyer"}
         self.active_roi = None
         self.drag_info = {}
+        self.handle_size = 8
 
         self.create_widgets()
 
@@ -62,9 +63,6 @@ class StuntCVApp:
         self.canvas_middle.bind("<Button-1>", self.on_roi_press)
         self.canvas_middle.bind("<B1-Motion>", self.on_roi_drag)
         self.canvas_middle.bind("<ButtonRelease-1>", self.on_roi_release)
-        self.canvas_middle.bind("<Button-3>", self.on_roi_press)
-        self.canvas_middle.bind("<B3-Motion>", self.on_roi_drag)
-        self.canvas_middle.bind("<ButtonRelease-3>", self.on_roi_release)
 
         self.slider = tk.Scale(self.root, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_slider_move)
         self.slider.pack(fill=tk.X, padx=10, pady=5)
@@ -154,24 +152,25 @@ class StuntCVApp:
             self.draw_rois_on_canvas(self.canvas_middle)
 
     def draw_rois_on_canvas(self, canvas):
-        canvas.delete("roi_base", "roi_flyer")
-        if self.track_base.get():
-            print(f"BASE @ x: {self.base_roi['x']} y: {self.base_roi['y']}")
-            canvas.create_rectangle(self.base_roi["x"], self.base_roi["y"], self.base_roi["x"] + self.base_roi["w"], self.base_roi["y"] + self.base_roi["h"], outline="red", width=2, tags="roi_base")
-        if self.track_flyer.get():
-            print(f"FLYER @ x: {self.flyer_roi['x']} y: {self.flyer_roi['y']}")
-            canvas.create_rectangle(self.flyer_roi["x"], self.flyer_roi["y"], self.flyer_roi["x"] + self.flyer_roi["w"], self.flyer_roi["y"] + self.flyer_roi["h"], outline="blue", width=2, tags="roi_flyer")
+        canvas.delete("roi")
+        for roi, color in [(self.base_roi, "red"), (self.flyer_roi, "blue")]:
+            if (roi["name"] == "base" and self.track_base.get()) or (roi["name"] == "flyer" and self.track_flyer.get()):
+                x1, y1, x2, y2 = roi["x"], roi["y"], roi["x"] + roi["w"], roi["y"] + roi["h"]
+                canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, tags="roi")
+                s = self.handle_size // 2
+                for h_pos in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+                    canvas.create_rectangle(h_pos[0]-s, h_pos[1]-s, h_pos[0]+s, h_pos[1]+s, fill=color, outline=color, tags="roi")
 
     def find_poses_by_roi(self, frame):
         base_results, flyer_results = None, None
-        h, w, _ = frame.shape
         if self.track_base.get():
-            base_results = self.process_single_roi(frame, self.base_roi, w, h)
+            base_results = self.process_single_roi(frame, self.base_roi)
         if self.track_flyer.get():
-            flyer_results = self.process_single_roi(frame, self.flyer_roi, w, h)
+            flyer_results = self.process_single_roi(frame, self.flyer_roi)
         return base_results, flyer_results
 
-    def process_single_roi(self, frame, roi, w, h):
+    def process_single_roi(self, frame, roi):
+        h, w, _ = frame.shape
         rx, ry, rw, rh = self.get_scaled_roi(roi, w, h)
         if rx < w and ry < h:
             crop = frame[ry:ry+rh, rx:rx+rw]
@@ -187,23 +186,18 @@ class StuntCVApp:
         h, w, _ = frame_rgb.shape
         results1 = self.pose.process(frame_rgb)
         results2 = None
-
         if results1.pose_landmarks:
             frame_rgb_copy = np.copy(frame_rgb)
             box1 = self.get_bounding_box(results1.pose_landmarks.landmark, w, h)
             cv2.rectangle(frame_rgb_copy, (int(box1[0])-10, int(box1[1])-10), (int(box1[2])+10, int(box1[3])+10), (0,0,0), -1)
             results2 = self.pose.process(frame_rgb_copy)
-
             if results2.pose_landmarks:
                 box2 = self.get_bounding_box(results2.pose_landmarks.landmark, w, h)
                 if self.calculate_iou(box1, box2) > 0.1: results2 = None
-        
         if results1 and results2 and results1.pose_landmarks and results2.pose_landmarks:
             avg_y1 = sum(lm.y for lm in results1.pose_landmarks.landmark)
             avg_y2 = sum(lm.y for lm in results2.pose_landmarks.landmark)
-            base, flyer = (results1, results2) if avg_y1 > avg_y2 else (results2, results1)
-            return base, flyer
-        
+            return (results1, results2) if avg_y1 > avg_y2 else (results2, results1)
         return results1, results2
 
     def draw_classified_poses(self, frame, base_results, flyer_results):
@@ -226,8 +220,7 @@ class StuntCVApp:
 
     def on_roi_toggle(self):
         if self.roi_tracking_enabled.get():
-            self.track_base.set(True)
-            self.track_flyer.set(True)
+            self.track_base.set(True); self.track_flyer.set(True)
         if self.current_frame_data is not None:
             self.process_and_display_frame()
 
@@ -235,44 +228,55 @@ class StuntCVApp:
         if self.current_frame_data is not None:
             self.process_and_display_frame()
 
+    def get_handle_at(self, x, y):
+        s = self.handle_size // 2
+        for roi in [self.flyer_roi, self.base_roi]:
+            if (roi["name"] == "base" and not self.track_base.get()) or (roi["name"] == "flyer" and not self.track_flyer.get()): continue
+            x1, y1, x2, y2 = roi["x"], roi["y"], roi["x"] + roi["w"], roi["y"] + roi["h"]
+            handles = {"tl": (x1, y1), "tr": (x2, y1), "bl": (x1, y2), "br": (x2, y2)}
+            for name, pos in handles.items():
+                if pos[0]-s <= x <= pos[0]+s and pos[1]-s <= y <= pos[1]+s: return roi, name
+        return None, None
+
     def on_roi_press(self, event):
         if not self.roi_tracking_enabled.get(): return
-        for roi in [self.flyer_roi, self.base_roi]:
-            if roi["x"] <= event.x <= roi["x"] + roi["w"] and roi["y"] <= event.y <= roi["y"] + roi["h"]:
-                self.active_roi = roi
-                self.drag_info = {"x": event.x, "y": event.y, "orig_x": roi["x"], "orig_y": roi["y"], "orig_w": roi["w"], "orig_h": roi["h"], "type": "move" if event.num == 1 else "resize"}
-                break
+        roi, handle = self.get_handle_at(event.x, event.y)
+        if handle:
+            self.active_roi = roi
+            self.drag_info = {"type": "resize", "handle": handle, "orig_x": event.x, "orig_y": event.y, "roi_x": roi["x"], "roi_y": roi["y"], "roi_w": roi["w"], "roi_h": roi["h"]}
+        else:
+            for r in [self.flyer_roi, self.base_roi]:
+                if r["x"] <= event.x <= r["x"] + r["w"] and r["y"] <= event.y <= r["y"] + r["h"]:
+                    self.active_roi = r
+                    self.drag_info = {"type": "move", "orig_x": event.x, "orig_y": event.y, "roi_x": r["x"], "roi_y": r["y"]}; break
 
     def on_roi_drag(self, event):
         if not self.active_roi: return
-        dx = event.x - self.drag_info["x"]
-        dy = event.y - self.drag_info["y"]
+        dx, dy = event.x - self.drag_info["orig_x"], event.y - self.drag_info["orig_y"]
         if self.drag_info["type"] == "move":
-            self.active_roi["x"] = self.drag_info["orig_x"] + dx
-            self.active_roi["y"] = self.drag_info["orig_y"] + dy
+            self.active_roi["x"] = self.drag_info["roi_x"] + dx
+            self.active_roi["y"] = self.drag_info["roi_y"] + dy
         else:
-            self.active_roi["w"] = max(20, self.drag_info["orig_w"] + dx)
-            self.active_roi["h"] = max(20, self.drag_info["orig_h"] + dy)
-        if not self.playing:
-            self.process_and_display_frame()
+            x, y, w, h = self.drag_info["roi_x"], self.drag_info["roi_y"], self.drag_info["roi_w"], self.drag_info["roi_h"]
+            if self.drag_info["handle"] in ["br", "tr"]: self.active_roi["w"] = max(20, w + dx)
+            if self.drag_info["handle"] in ["br", "bl"]: self.active_roi["h"] = max(20, h + dy)
+            if self.drag_info["handle"] in ["tl", "bl"]: self.active_roi["x"] = x + dx; self.active_roi["w"] = max(20, w - dx)
+            if self.drag_info["handle"] in ["tl", "tr"]: self.active_roi["y"] = y + dy; self.active_roi["h"] = max(20, h - dy)
+        if not self.playing: self.process_and_display_frame()
 
     def on_roi_release(self, event):
-        if not self.playing and self.active_roi:
-            self.process_and_display_frame()
-        self.active_roi = None
-        self.drag_info = {}
+        if not self.playing and self.active_roi: self.process_and_display_frame()
+        self.active_roi = None; self.drag_info = {}
 
     def get_bounding_box(self, landmarks, w, h):
-        x_coords = [lm.x * w for lm in landmarks]
-        y_coords = [lm.y * h for lm in landmarks]
+        x_coords = [lm.x * w for lm in landmarks]; y_coords = [lm.y * h for lm in landmarks]
         return min(x_coords), min(y_coords), max(x_coords), max(y_coords)
 
     def calculate_iou(self, box1, box2):
         x1_inter, y1_inter = max(box1[0], box2[0]), max(box1[1], box2[1])
         x2_inter, y2_inter = min(box1[2], box2[2]), min(box1[3], box2[3])
         inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
-        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1]); box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
         return inter_area / (box1_area + box2_area - inter_area + 1e-6)
 
     def get_scaled_roi(self, roi, frame_w, frame_h):
@@ -280,27 +284,52 @@ class StuntCVApp:
         return int(roi["x"]*scale_x), int(roi["y"]*scale_y), int(roi["w"]*scale_x), int(roi["h"]*scale_y)
 
     def translate_landmarks(self, landmarks, crop_x, crop_y, crop_w, crop_h, frame_w, frame_h):
-        for lm in landmarks.landmark:
-            lm.x = (lm.x * crop_w + crop_x) / frame_w
-            lm.y = (lm.y * crop_h + crop_y) / frame_h
+        for lm in landmarks.landmark: lm.x = (lm.x * crop_w + crop_x) / frame_w; lm.y = (lm.y * crop_h + crop_y) / frame_h
 
     def smooth_pose(self, results, history):
-        if not results or not results.pose_landmarks: 
-            history.clear()
-            return None
+        if not results or not results.pose_landmarks: history.clear(); return None
         history.append(results.pose_landmarks.landmark)
         smoothed_list = landmark_pb2.NormalizedLandmarkList()
         for i in range(len(history[0])):
-            avg_x = sum(frame[i].x for frame in history) / len(history)
-            avg_y = sum(frame[i].y for frame in history) / len(history)
-            avg_z = sum(frame[i].z for frame in history) / len(history)
-            avg_vis = sum(frame[i].visibility for frame in history) / len(history)
-            lm = smoothed_list.landmark.add()
-            lm.x, lm.y, lm.z, lm.visibility = avg_x, avg_y, avg_z, avg_vis
+            avg_x = sum(frame[i].x for frame in history) / len(history); avg_y = sum(frame[i].y for frame in history) / len(history)
+            avg_z = sum(frame[i].z for frame in history) / len(history); avg_vis = sum(frame[i].visibility for frame in history) / len(history)
+            lm = smoothed_list.landmark.add(); lm.x, lm.y, lm.z, lm.visibility = avg_x, avg_y, avg_z, avg_vis
         return SmoothedResults(smoothed_list)
 
     def save_video(self):
-        print("Save function needs to be updated for ROI mode.")
+        if not self.video_path: messagebox.showwarning("No Video", "Please open a video file first."); return
+        dialog = tk.Toplevel(self.root); dialog.title("Save Options"); dialog.geometry("300x100"); dialog.resizable(False, False)
+        dialog.geometry(f"+{self.root.winfo_x()+150}+{self.root.winfo_y()+150}")
+        tk.Label(dialog, text="Choose what to save:").pack(pady=10)
+        btn_frame = tk.Frame(dialog); btn_frame.pack()
+        def save_and_close(mocap_only): dialog.destroy(); self._execute_save(mocap_only)
+        tk.Button(btn_frame, text="Video with Mocap", command=lambda: save_and_close(False)).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="Mocap Only", command=lambda: save_and_close(True)).pack(side=tk.LEFT, padx=10)
+
+    def _execute_save(self, mocap_only):
+        save_path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")], title="Save Video As")
+        if not save_path: return
+        cap = cv2.VideoCapture(self.video_path)
+        width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
+        out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window), deque(maxlen=self.smoothing_window)
+        roi_enabled = self.roi_tracking_enabled.get()
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        progress_dialog = tk.Toplevel(self.root); progress_dialog.title("Saving...")
+        progress_label = tk.Label(progress_dialog, text=f"Processing frame 0/{num_frames}"); progress_label.pack(padx=20, pady=10)
+        progress_dialog.geometry(f"+{self.root.winfo_x()+150}+{self.root.winfo_y()+150}"); self.root.update_idletasks()
+        for i in range(num_frames):
+            ret, frame = cap.read()
+            if not ret: break
+            output_frame = np.zeros_like(frame) if mocap_only else frame.copy()
+            if roi_enabled: base_results, flyer_results = self.find_poses_by_roi(frame)
+            else: base_results, flyer_results = self.find_poses_auto(frame)
+            smoothed_base, smoothed_flyer = self.smooth_pose(base_results, save_base_hist), self.smooth_pose(flyer_results, save_flyer_hist)
+            self.draw_classified_poses(output_frame, smoothed_base, smoothed_flyer)
+            out.write(output_frame)
+            progress_label.config(text=f"Processing frame {i+1}/{num_frames}"); self.root.update_idletasks()
+        cap.release(); out.release(); progress_dialog.destroy()
+        messagebox.showinfo("Save Complete", f"Video saved to {save_path}")
 
 if __name__ == "__main__":
     root = tk.Tk()
