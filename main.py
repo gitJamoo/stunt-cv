@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import numpy as np
+import csv
 from collections import deque
 from mediapipe.framework.formats import landmark_pb2
 
@@ -47,6 +48,10 @@ class StuntCVApp:
         self.drag_info = {}
         self.handle_size = 8
 
+        # Tracking State
+        self.last_base_results = None
+        self.last_flyer_results = None
+
         self.create_widgets()
 
     def create_widgets(self):
@@ -76,6 +81,8 @@ class StuntCVApp:
         self.btn_play.pack(side=tk.LEFT, padx=5)
         self.btn_save = tk.Button(self.controls_frame, text="Save Video", command=self.save_video)
         self.btn_save.pack(side=tk.LEFT, padx=5)
+        self.btn_save_csv = tk.Button(self.controls_frame, text="Save CSV", command=self.save_csv_data)
+        self.btn_save_csv.pack(side=tk.LEFT, padx=5)
         
         self.chk_roi = tk.Checkbutton(self.controls_frame, text="Enable ROI Tracking", var=self.roi_tracking_enabled, command=self.on_roi_toggle)
         self.chk_roi.pack(side=tk.LEFT, padx=10)
@@ -90,6 +97,7 @@ class StuntCVApp:
 
         self.playing = False
         self.base_history.clear(); self.flyer_history.clear()
+        self.last_base_results, self.last_flyer_results = None, None # Reset trackers
         self.cap = cv2.VideoCapture(self.video_path)
         self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -184,21 +192,94 @@ class StuntCVApp:
     def find_poses_auto(self, frame):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, _ = frame_rgb.shape
-        results1 = self.pose.process(frame_rgb)
-        results2 = None
-        if results1.pose_landmarks:
+        all_results = self.pose.process(frame_rgb).pose_landmarks
+
+        # This is a simplified stand-in for a multi-pose detection model.
+        # We process the frame once, then blank out the first person and process again.
+        detected_poses = []
+        if all_results:
+            detected_poses.append(all_results)
             frame_rgb_copy = np.copy(frame_rgb)
-            box1 = self.get_bounding_box(results1.pose_landmarks.landmark, w, h)
+            box1 = self.get_bounding_box(all_results.landmark, w, h)
             cv2.rectangle(frame_rgb_copy, (int(box1[0])-10, int(box1[1])-10), (int(box1[2])+10, int(box1[3])+10), (0,0,0), -1)
-            results2 = self.pose.process(frame_rgb_copy)
-            if results2.pose_landmarks:
-                box2 = self.get_bounding_box(results2.pose_landmarks.landmark, w, h)
-                if self.calculate_iou(box1, box2) > 0.1: results2 = None
-        if results1 and results2 and results1.pose_landmarks and results2.pose_landmarks:
-            avg_y1 = sum(lm.y for lm in results1.pose_landmarks.landmark)
-            avg_y2 = sum(lm.y for lm in results2.pose_landmarks.landmark)
-            return (results1, results2) if avg_y1 > avg_y2 else (results2, results1)
-        return results1, results2
+            
+            second_results = self.pose.process(frame_rgb_copy).pose_landmarks
+            if second_results:
+                box2 = self.get_bounding_box(second_results.landmark, w, h)
+                # Simple check to ensure the second person is reasonably distinct
+                if self.calculate_iou(box1, box2) < 0.1:
+                    detected_poses.append(second_results)
+
+        current_base, current_flyer = None, None
+
+        # If we have previous tracking data, use it to match
+        if self.last_base_results or self.last_flyer_results:
+            matched_indices = set()
+
+            # Match for Base
+            if self.last_base_results:
+                last_box = self.get_bounding_box(self.last_base_results.landmark, w, h)
+                best_match_idx, best_iou = -1, 0
+                for i, pose in enumerate(detected_poses):
+                    current_box = self.get_bounding_box(pose.landmark, w, h)
+                    iou = self.calculate_iou(last_box, current_box)
+                    if i not in matched_indices and iou > best_iou:
+                        best_iou = iou
+                        best_match_idx = i
+                if best_match_idx != -1 and best_iou > 0.1: # Threshold for a valid match
+                    current_base = detected_poses[best_match_idx]
+                    matched_indices.add(best_match_idx)
+
+            # Match for Flyer
+            if self.last_flyer_results:
+                last_box = self.get_bounding_box(self.last_flyer_results.landmark, w, h)
+                best_match_idx, best_iou = -1, 0
+                for i, pose in enumerate(detected_poses):
+                    if i in matched_indices: continue
+                    current_box = self.get_bounding_box(pose.landmark, w, h)
+                    iou = self.calculate_iou(last_box, current_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match_idx = i
+                if best_match_idx != -1 and best_iou > 0.1:
+                    current_flyer = detected_poses[best_match_idx]
+                    matched_indices.add(best_match_idx)
+            
+            # Assign any remaining poses
+            for i, pose in enumerate(detected_poses):
+                if i not in matched_indices:
+                    if not current_base:
+                        current_base = pose
+                    elif not current_flyer:
+                        current_flyer = pose
+
+        # If no tracking data, use vertical position as a fallback for the first frame
+        else:
+            if len(detected_poses) == 1:
+                current_base = detected_poses[0]
+            elif len(detected_poses) == 2:
+                avg_y1 = sum(lm.y for lm in detected_poses[0].landmark)
+                avg_y2 = sum(lm.y for lm in detected_poses[1].landmark)
+                if avg_y1 > avg_y2:
+                    current_base, current_flyer = detected_poses[0], detected_poses[1]
+                else:
+                    current_base, current_flyer = detected_poses[1], detected_poses[0]
+
+        # Wrap results in the expected class structure and update state
+        base_results_obj, flyer_results_obj = None, None
+        if current_base:
+            base_results_obj = SmoothedResults(current_base)
+            self.last_base_results = current_base
+        else:
+            self.last_base_results = None
+
+        if current_flyer:
+            flyer_results_obj = SmoothedResults(current_flyer)
+            self.last_flyer_results = current_flyer
+        else:
+            self.last_flyer_results = None
+
+        return base_results_obj, flyer_results_obj
 
     def draw_classified_poses(self, frame, base_results, flyer_results):
         if self.track_base.get() and base_results and base_results.pose_landmarks:
@@ -313,6 +394,7 @@ class StuntCVApp:
         width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
         out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
         save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window), deque(maxlen=self.smoothing_window)
+        last_base_results, last_flyer_results = None, None # Local tracker state for saving
         roi_enabled = self.roi_tracking_enabled.get()
         num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         progress_dialog = tk.Toplevel(self.root); progress_dialog.title("Saving...")
@@ -322,14 +404,145 @@ class StuntCVApp:
             ret, frame = cap.read()
             if not ret: break
             output_frame = np.zeros_like(frame) if mocap_only else frame.copy()
-            if roi_enabled: base_results, flyer_results = self.find_poses_by_roi(frame)
-            else: base_results, flyer_results = self.find_poses_auto(frame)
+            
+            # Use a local tracking state for the save process
+            if roi_enabled:
+                base_results, flyer_results = self.find_poses_by_roi(frame)
+            else:
+                # We need to replicate the tracking logic here for the save process
+                base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
+
             smoothed_base, smoothed_flyer = self.smooth_pose(base_results, save_base_hist), self.smooth_pose(flyer_results, save_flyer_hist)
             self.draw_classified_poses(output_frame, smoothed_base, smoothed_flyer)
             out.write(output_frame)
             progress_label.config(text=f"Processing frame {i+1}/{num_frames}"); self.root.update_idletasks()
         cap.release(); out.release(); progress_dialog.destroy()
         messagebox.showinfo("Save Complete", f"Video saved to {save_path}")
+
+    def save_csv_data(self):
+        if not self.video_path:
+            messagebox.showwarning("No Video", "Please open a video file first.")
+            return
+        self._execute_csv_save()
+
+    def _execute_csv_save(self):
+        save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")], title="Save CSV As")
+        if not save_path:
+            return
+
+        cap = cv2.VideoCapture(self.video_path)
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        progress_dialog = tk.Toplevel(self.root)
+        progress_dialog.title("Saving CSV...")
+        progress_label = tk.Label(progress_dialog, text=f"Processing frame 0/{num_frames}")
+        progress_label.pack(padx=20, pady=10)
+        progress_dialog.geometry(f"+{self.root.winfo_x()+150}+{self.root.winfo_y()+150}")
+        self.root.update_idletasks()
+
+        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window), deque(maxlen=self.smoothing_window)
+        last_base_results, last_flyer_results = None, None # Local tracker state for saving
+        roi_enabled = self.roi_tracking_enabled.get()
+
+        with open(save_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            header = ['frame', 'person_id', 'landmark', 'x', 'y', 'z', 'visibility']
+            writer.writerow(header)
+
+            for i in range(num_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if roi_enabled:
+                    base_results, flyer_results = self.find_poses_by_roi(frame)
+                else:
+                    base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
+
+                smoothed_base = self.smooth_pose(base_results, save_base_hist)
+                smoothed_flyer = self.smooth_pose(flyer_results, save_flyer_hist)
+
+                for person_id, results in [('base', smoothed_base), ('flyer', smoothed_flyer)]:
+                    if results and results.pose_landmarks:
+                        for j, lm in enumerate(results.pose_landmarks.landmark):
+                            writer.writerow([i, person_id, j, lm.x, lm.y, lm.z, lm.visibility])
+                
+                progress_label.config(text=f"Processing frame {i+1}/{num_frames}")
+                self.root.update_idletasks()
+
+        cap.release()
+        progress_dialog.destroy()
+        messagebox.showinfo("Save Complete", f"CSV data saved to {save_path}")
+
+    def _find_poses_auto_for_save(self, frame, last_base, last_flyer):
+        # This is a non-state-updating version of find_poses_auto for file saving
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame_rgb.shape
+        all_results = self.pose.process(frame_rgb).pose_landmarks
+
+        detected_poses = []
+        if all_results:
+            detected_poses.append(all_results)
+            frame_rgb_copy = np.copy(frame_rgb)
+            box1 = self.get_bounding_box(all_results.landmark, w, h)
+            cv2.rectangle(frame_rgb_copy, (int(box1[0])-10, int(box1[1])-10), (int(box1[2])+10, int(box1[3])+10), (0,0,0), -1)
+            second_results = self.pose.process(frame_rgb_copy).pose_landmarks
+            if second_results:
+                box2 = self.get_bounding_box(second_results.landmark, w, h)
+                if self.calculate_iou(box1, box2) < 0.1:
+                    detected_poses.append(second_results)
+
+        current_base, current_flyer = None, None
+
+        if last_base or last_flyer:
+            matched_indices = set()
+            if last_base:
+                last_box = self.get_bounding_box(last_base.landmark, w, h)
+                best_match_idx, best_iou = -1, 0
+                for i, pose in enumerate(detected_poses):
+                    current_box = self.get_bounding_box(pose.landmark, w, h)
+                    iou = self.calculate_iou(last_box, current_box)
+                    if i not in matched_indices and iou > best_iou:
+                        best_iou = iou
+                        best_match_idx = i
+                if best_match_idx != -1 and best_iou > 0.1:
+                    current_base = detected_poses[best_match_idx]
+                    matched_indices.add(best_match_idx)
+
+            if last_flyer:
+                last_box = self.get_bounding_box(last_flyer.landmark, w, h)
+                best_match_idx, best_iou = -1, 0
+                for i, pose in enumerate(detected_poses):
+                    if i in matched_indices: continue
+                    current_box = self.get_bounding_box(pose.landmark, w, h)
+                    iou = self.calculate_iou(last_box, current_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match_idx = i
+                if best_match_idx != -1 and best_iou > 0.1:
+                    current_flyer = detected_poses[best_match_idx]
+                    matched_indices.add(best_match_idx)
+            
+            for i, pose in enumerate(detected_poses):
+                if i not in matched_indices:
+                    if not current_base: current_base = pose
+                    elif not current_flyer: current_flyer = pose
+        else:
+            if len(detected_poses) == 1:
+                current_base = detected_poses[0]
+            elif len(detected_poses) == 2:
+                avg_y1 = sum(lm.y for lm in detected_poses[0].landmark)
+                avg_y2 = sum(lm.y for lm in detected_poses[1].landmark)
+                if avg_y1 > avg_y2:
+                    current_base, current_flyer = detected_poses[0], detected_poses[1]
+                else:
+                    current_base, current_flyer = detected_poses[1], detected_poses[0]
+
+        base_results_obj = SmoothedResults(current_base) if current_base else None
+        flyer_results_obj = SmoothedResults(current_flyer) if current_flyer else None
+        
+        # Return the new state to be used in the next iteration of the save loop
+        return base_results_obj, flyer_results_obj, current_base, current_flyer
 
 if __name__ == "__main__":
     root = tk.Tk()
