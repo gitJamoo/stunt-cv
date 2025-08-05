@@ -40,6 +40,7 @@ class StuntCVApp:
         self.roi_tracking_enabled = tk.BooleanVar(value=False)
         self.track_base = tk.BooleanVar(value=True)
         self.track_flyer = tk.BooleanVar(value=True)
+        self.show_stats = tk.BooleanVar(value=False)
 
         # ROI State
         self.base_roi =  {"x": 30,  "y": 110, "w": 150, "h": 180, "name": "base"}
@@ -51,6 +52,11 @@ class StuntCVApp:
         # Tracking State
         self.last_base_results = None
         self.last_flyer_results = None
+
+        # Stats State
+        self.last_com_base = None
+        self.last_com_flyer = None
+        self.last_frame_time = None
 
         self.create_widgets()
 
@@ -90,6 +96,8 @@ class StuntCVApp:
         self.chk_base.pack(side=tk.LEFT, padx=5)
         self.chk_flyer = tk.Checkbutton(self.controls_frame, text="Track Flyer", var=self.track_flyer, command=self.on_visibility_toggle)
         self.chk_flyer.pack(side=tk.LEFT, padx=5)
+        self.chk_stats = tk.Checkbutton(self.controls_frame, text="Show Stats", var=self.show_stats, command=self.on_visibility_toggle)
+        self.chk_stats.pack(side=tk.LEFT, padx=10)
 
     def open_video(self):
         self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi")])
@@ -113,19 +121,25 @@ class StuntCVApp:
 
     def video_loop(self):
         if self.playing and self.cap and self.cap.isOpened():
+            current_time = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if self.last_frame_time is None:
+                self.last_frame_time = current_time
+
             ret, frame = self.cap.read()
             if ret:
                 self.current_frame_data = frame
-                self.process_and_display_frame()
+                time_delta = current_time - self.last_frame_time
+                self.process_and_display_frame(time_delta)
+                self.last_frame_time = current_time
                 self.root.after(15, self.video_loop)
             else:
                 self.playing = False
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self.cap.read()
                 if ret: self.current_frame_data = frame
-                self.process_and_display_frame()
+                self.process_and_display_frame(0)
 
-    def process_and_display_frame(self):
+    def process_and_display_frame(self, time_delta=0):
         if self.current_frame_data is None: return
         frame = self.current_frame_data
         
@@ -140,6 +154,9 @@ class StuntCVApp:
 
         smoothed_base = self.smooth_pose(base_results, self.base_history)
         smoothed_flyer = self.smooth_pose(flyer_results, self.flyer_history)
+
+        if self.show_stats.get():
+            self.calculate_and_draw_stats(overlay_frame, smoothed_base, smoothed_flyer, time_delta)
 
         self.draw_classified_poses(overlay_frame, smoothed_base, smoothed_flyer)
         self.draw_classified_poses(pose_only_frame, smoothed_base, smoothed_flyer)
@@ -349,6 +366,25 @@ class StuntCVApp:
         if not self.playing and self.active_roi: self.process_and_display_frame()
         self.active_roi = None; self.drag_info = {}
 
+    def calculate_and_draw_stats(self, frame, base_results, flyer_results, time_delta):
+        h, w, _ = frame.shape
+        
+        # Base Velocity
+        base_com = self.calculate_center_of_mass(base_results.pose_landmarks if base_results else None, w, h)
+        if base_com and self.last_com_base and time_delta > 0:
+            dist_pixels = np.linalg.norm(np.array(base_com) - np.array(self.last_com_base))
+            velocity_pps = dist_pixels / time_delta # Pixels per second
+            cv2.putText(frame, f"Base Vel: {velocity_pps:.2f} pps", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        self.last_com_base = base_com
+
+        # Flyer Velocity
+        flyer_com = self.calculate_center_of_mass(flyer_results.pose_landmarks if flyer_results else None, w, h)
+        if flyer_com and self.last_com_flyer and time_delta > 0:
+            dist_pixels = np.linalg.norm(np.array(flyer_com) - np.array(self.last_com_flyer))
+            velocity_pps = dist_pixels / time_delta # Pixels per second
+            cv2.putText(frame, f"Flyer Vel: {velocity_pps:.2f} pps", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        self.last_com_flyer = flyer_com
+
     def get_bounding_box(self, landmarks, w, h):
         x_coords = [lm.x * w for lm in landmarks]; y_coords = [lm.y * h for lm in landmarks]
         return min(x_coords), min(y_coords), max(x_coords), max(y_coords)
@@ -358,7 +394,32 @@ class StuntCVApp:
         x2_inter, y2_inter = min(box1[2], box2[2]), min(box1[3], box2[3])
         inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
         box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1]); box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        return inter_area / (box1_area + box2_area - inter_area + 1e-6)
+        return inter_area / (box1_area + box2_area + 1e-6)
+
+    def calculate_center_of_mass(self, landmarks, w, h):
+        if not landmarks: return None
+        # A simple approximation of CoM using key body landmarks
+        # Weights can be adjusted for better accuracy
+        com_indices = {
+            'torso_center': (11, 12, 23, 24), # Shoulders and Hips
+            'legs': (25, 26, 27, 28),
+            'arms': (13, 14, 15, 16)
+        }
+        total_weight = 0
+        com_x, com_y = 0, 0
+        
+        for part, indices in com_indices.items():
+            weight = 1.0 # Simple weighting
+            for idx in indices:
+                if idx < len(landmarks.landmark):
+                    lm = landmarks.landmark[idx]
+                    if lm.visibility > 0.5: # Only include visible landmarks
+                        com_x += lm.x * w * weight
+                        com_y += lm.y * h * weight
+                        total_weight += weight
+        
+        if total_weight == 0: return None
+        return (com_x / total_weight, com_y / total_weight)
 
     def get_scaled_roi(self, roi, frame_w, frame_h):
         scale_x, scale_y = frame_w / self.display_width, frame_h / self.display_height
