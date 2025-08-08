@@ -58,11 +58,19 @@ class StuntCVApp:
         self.last_com_flyer = None
         self.last_frame_time = None
 
+        # Stats UI Variables
+        self.base_velocity_var = tk.StringVar(value="Base Vel: N/A")
+        self.flyer_velocity_var = tk.StringVar(value="Flyer Vel: N/A")
+
         self.create_widgets()
 
     def create_widgets(self):
-        self.video_frame = tk.Frame(self.root)
-        self.video_frame.pack()
+        # Main content frame
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(padx=5, pady=5)
+
+        self.video_frame = tk.Frame(main_frame)
+        self.video_frame.pack(side=tk.LEFT)
 
         self.canvas_left = tk.Canvas(self.video_frame, width=self.display_width, height=self.display_height, bg='black')
         self.canvas_left.pack(side=tk.LEFT, padx=5, pady=5)
@@ -70,6 +78,15 @@ class StuntCVApp:
         self.canvas_middle.pack(side=tk.LEFT, padx=5, pady=5)
         self.canvas_right = tk.Canvas(self.video_frame, width=self.display_width, height=self.display_height, bg='black')
         self.canvas_right.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Stats Panel
+        self.stats_frame = tk.Frame(main_frame, bd=2, relief=tk.SUNKEN)
+        # Don't pack it yet, will be controlled by checkbox
+
+        tk.Label(self.stats_frame, text="Live Stats", font=("Arial", 12, "bold")).pack(pady=5, padx=10)
+        tk.Label(self.stats_frame, textvariable=self.base_velocity_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+        tk.Label(self.stats_frame, textvariable=self.flyer_velocity_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+
 
         self.canvas_middle.bind("<Button-1>", self.on_roi_press)
         self.canvas_middle.bind("<B1-Motion>", self.on_roi_drag)
@@ -156,7 +173,7 @@ class StuntCVApp:
         smoothed_flyer = self.smooth_pose(flyer_results, self.flyer_history)
 
         if self.show_stats.get():
-            self.calculate_and_draw_stats(overlay_frame, smoothed_base, smoothed_flyer, time_delta)
+            self.update_stats_panel(smoothed_base, smoothed_flyer, time_delta)
 
         self.draw_classified_poses(overlay_frame, smoothed_base, smoothed_flyer)
         self.draw_classified_poses(pose_only_frame, smoothed_base, smoothed_flyer)
@@ -323,6 +340,11 @@ class StuntCVApp:
             self.process_and_display_frame()
 
     def on_visibility_toggle(self):
+        if self.show_stats.get():
+            self.stats_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        else:
+            self.stats_frame.pack_forget()
+
         if self.current_frame_data is not None:
             self.process_and_display_frame()
 
@@ -366,15 +388,17 @@ class StuntCVApp:
         if not self.playing and self.active_roi: self.process_and_display_frame()
         self.active_roi = None; self.drag_info = {}
 
-    def calculate_and_draw_stats(self, frame, base_results, flyer_results, time_delta):
-        h, w, _ = frame.shape
+    def update_stats_panel(self, base_results, flyer_results, time_delta):
+        h, w = self.video_height, self.video_width
         
         # Base Velocity
         base_com = self.calculate_center_of_mass(base_results.pose_landmarks if base_results else None, w, h)
         if base_com and self.last_com_base and time_delta > 0:
             dist_pixels = np.linalg.norm(np.array(base_com) - np.array(self.last_com_base))
             velocity_pps = dist_pixels / time_delta # Pixels per second
-            cv2.putText(frame, f"Base Vel: {velocity_pps:.2f} pps", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            self.base_velocity_var.set(f"Base Vel: {velocity_pps:.2f} pps")
+        else:
+            self.base_velocity_var.set("Base Vel: N/A")
         self.last_com_base = base_com
 
         # Flyer Velocity
@@ -382,7 +406,9 @@ class StuntCVApp:
         if flyer_com and self.last_com_flyer and time_delta > 0:
             dist_pixels = np.linalg.norm(np.array(flyer_com) - np.array(self.last_com_flyer))
             velocity_pps = dist_pixels / time_delta # Pixels per second
-            cv2.putText(frame, f"Flyer Vel: {velocity_pps:.2f} pps", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            self.flyer_velocity_var.set(f"Flyer Vel: {velocity_pps:.2f} pps")
+        else:
+            self.flyer_velocity_var.set("Flyer Vel: N/A")
         self.last_com_flyer = flyer_com
 
     def get_bounding_box(self, landmarks, w, h):
