@@ -9,6 +9,10 @@ import csv
 from collections import deque
 from mediapipe.framework.formats import landmark_pb2
 
+import pandas as pd
+import plotly.express as px
+import os
+
 class SmoothedResults:
     def __init__(self, landmarks):
         self.pose_landmarks = landmarks
@@ -106,6 +110,8 @@ class StuntCVApp:
         self.btn_save.pack(side=tk.LEFT, padx=5)
         self.btn_save_csv = tk.Button(self.controls_frame, text="Save CSV", command=self.save_csv_data)
         self.btn_save_csv.pack(side=tk.LEFT, padx=5)
+        self.btn_save_viz = tk.Button(self.controls_frame, text="Save CSV + Viz", command=self.save_csv_and_viz)
+        self.btn_save_viz.pack(side=tk.LEFT, padx=5)
         
         self.chk_roi = tk.Checkbutton(self.controls_frame, text="Enable ROI Tracking", var=self.roi_tracking_enabled, command=self.on_roi_toggle)
         self.chk_roi.pack(side=tk.LEFT, padx=10)
@@ -560,6 +566,71 @@ class StuntCVApp:
         cap.release()
         progress_dialog.destroy()
         messagebox.showinfo("Save Complete", f"CSV data saved to {save_path}")
+        return save_path # Return path on success
+
+    def save_csv_and_viz(self):
+        if not self.video_path:
+            messagebox.showwarning("No Video", "Please open a video file first.")
+            return
+        
+        csv_path = self._execute_csv_save()
+        if csv_path:
+            self._generate_visualization(csv_path)
+
+    def _generate_visualization(self, csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            if df.empty:
+                messagebox.showwarning("Empty Data", "The CSV file is empty, cannot generate visualization.")
+                return
+
+            # Calculate CoM for each frame from the raw landmark data
+            com_data = []
+            for frame_num, frame_df in df.groupby('frame'):
+                for person_id, person_df in frame_df.groupby('person_id'):
+                    # Use the same CoM logic as the live stats
+                    com_indices = {
+                        'torso_center': (11, 12, 23, 24), # Shoulders and Hips
+                        'legs': (25, 26, 27, 28),
+                        'arms': (13, 14, 15, 16)
+                    }
+                    total_weight = 0
+                    com_x, com_y = 0, 0
+                    for part, indices in com_indices.items():
+                        weight = 1.0
+                        for idx in indices:
+                            lm = person_df[person_df['landmark'] == idx]
+                            if not lm.empty and lm['visibility'].iloc[0] > 0.5:
+                                com_x += lm['x'].iloc[0] * weight
+                                com_y += lm['y'].iloc[0] * weight
+                                total_weight += weight
+                    
+                    if total_weight > 0:
+                        com_data.append({
+                            'frame': frame_num,
+                            'person_id': person_id,
+                            'com_y': 1 - (com_y / total_weight) # Invert Y-axis for intuitive plotting (0 at bottom)
+                        })
+            
+            if not com_data:
+                messagebox.showwarning("No Data", "Could not calculate Center of Mass from the data.")
+                return
+
+            viz_df = pd.DataFrame(com_data)
+
+            fig = px.line(viz_df, x='frame', y='com_y', color='person_id',
+                          title='Vertical Center of Mass Over Time',
+                          labels={'frame': 'Frame Number', 'com_y': 'Vertical Position (Normalized)', 'person_id': 'Performer'},
+                          color_discrete_map={'base': 'red', 'flyer': 'blue'})
+            
+            fig.update_layout(legend_title_text='Performer')
+
+            html_path = os.path.splitext(csv_path)[0] + '_visualization.html'
+            fig.write_html(html_path)
+            messagebox.showinfo("Visualization Saved", f"Interactive visualization saved to {html_path}")
+
+        except Exception as e:
+            messagebox.showerror("Visualization Error", f"An error occurred while creating the visualization: {e}")
 
     def _find_poses_auto_for_save(self, frame, last_base, last_flyer):
         # This is a non-state-updating version of find_poses_auto for file saving
