@@ -144,7 +144,15 @@ class StuntCVApp:
         self.smoothing_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def open_video(self):
-        self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi")])
+        # Define the target directory for videos, create it if it doesn't exist
+        videos_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'raw_videos')
+        os.makedirs(videos_dir, exist_ok=True)
+
+        self.video_path = filedialog.askopenfilename(
+            initialdir=videos_dir,
+            title="Select a video file",
+            filetypes=[("Video files", "*.mp4 *.avi")]
+        )
         if not self.video_path: return
 
         self.playing = False
@@ -541,7 +549,9 @@ class StuntCVApp:
         tk.Button(btn_frame, text="Mocap Only", command=lambda: save_and_close(True)).pack(side=tk.LEFT, padx=10)
 
     def _execute_save(self, mocap_only):
-        save_path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")], title="Save Video As")
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'edited_videos')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = filedialog.asksaveasfilename(initialdir=save_dir, defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")], title="Save Video As")
         if not save_path: return
         cap = cv2.VideoCapture(self.video_path)
         width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
