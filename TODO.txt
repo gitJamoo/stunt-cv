@@ -9,3 +9,8 @@
       would help in breaking down a sequence and focusing the analysis on specific phases of the stunt.
     6. Side-by-Side Comparison: Implement a feature to load two videos and analyze them simultaneously. This is invaluable for
       comparing different attempts of the same skill.
+
+
+Please also make the output include these in the output. Calculate a wobbliness/unstableness for each performer and        │
+│   also make a graph for velocity and acceleration per performer. Please also calculate a bases joint alignment and a         │
+│   flyers "plumb line". Finally, please find a way to calculate an overall stunt score 

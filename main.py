@@ -1,4 +1,3 @@
-
 import cv2
 import mediapipe as mp
 import tkinter as tk
@@ -35,10 +34,12 @@ class StuntCVApp:
         self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
         self.mp_drawing = mp.solutions.drawing_utils
 
+        # UI-Controlled Tracking Parameters
+        self.smoothing_window_var = tk.IntVar(value=10)
+
         # Smoothing Deques
-        self.smoothing_window = 5
-        self.base_history = deque(maxlen=self.smoothing_window)
-        self.flyer_history = deque(maxlen=self.smoothing_window)
+        self.base_history = deque(maxlen=self.smoothing_window_var.get())
+        self.flyer_history = deque(maxlen=self.smoothing_window_var.get())
 
         # UI State Variables
         self.roi_tracking_enabled = tk.BooleanVar(value=False)
@@ -61,10 +62,17 @@ class StuntCVApp:
         self.last_com_base = None
         self.last_com_flyer = None
         self.last_frame_time = None
+        self.base_com_history = deque(maxlen=15) # For wobbliness calculation
+        self.flyer_com_history = deque(maxlen=15)
 
         # Stats UI Variables
         self.base_velocity_var = tk.StringVar(value="Base Vel: N/A")
         self.flyer_velocity_var = tk.StringVar(value="Flyer Vel: N/A")
+        self.base_wobble_var = tk.StringVar(value="Base Wobble: N/A")
+        self.flyer_wobble_var = tk.StringVar(value="Flyer Wobble: N/A")
+        self.alignment_var = tk.StringVar(value="Alignment: N/A")
+        self.plumb_line_var = tk.StringVar(value="Plumb Line: N/A")
+        self.stunt_score_var = tk.StringVar(value="Stunt Score: N/A")
 
         self.create_widgets()
 
@@ -90,6 +98,11 @@ class StuntCVApp:
         tk.Label(self.stats_frame, text="Live Stats", font=("Arial", 12, "bold")).pack(pady=5, padx=10)
         tk.Label(self.stats_frame, textvariable=self.base_velocity_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
         tk.Label(self.stats_frame, textvariable=self.flyer_velocity_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+        tk.Label(self.stats_frame, textvariable=self.base_wobble_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+        tk.Label(self.stats_frame, textvariable=self.flyer_wobble_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+        tk.Label(self.stats_frame, textvariable=self.alignment_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+        tk.Label(self.stats_frame, textvariable=self.plumb_line_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
+        tk.Label(self.stats_frame, textvariable=self.stunt_score_var, font=("Arial", 14, "bold"), fg="#0077c2").pack(pady=10, padx=10, anchor="center")
 
 
         self.canvas_middle.bind("<Button-1>", self.on_roi_press)
@@ -121,6 +134,14 @@ class StuntCVApp:
         self.chk_flyer.pack(side=tk.LEFT, padx=5)
         self.chk_stats = tk.Checkbutton(self.controls_frame, text="Show Stats", var=self.show_stats, command=self.on_visibility_toggle)
         self.chk_stats.pack(side=tk.LEFT, padx=10)
+
+        # Advanced Controls
+        self.adv_controls_frame = tk.LabelFrame(self.root, text="Tracking Controls", padx=10, pady=10)
+        self.adv_controls_frame.pack(padx=10, pady=5, fill=tk.X)
+
+        tk.Label(self.adv_controls_frame, text="Smoothing:").pack(side=tk.LEFT, padx=(0, 5))
+        self.smoothing_slider = tk.Scale(self.adv_controls_frame, from_=1, to=30, orient=tk.HORIZONTAL, variable=self.smoothing_window_var, command=self.on_smoothing_update)
+        self.smoothing_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def open_video(self):
         self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi")])
@@ -394,28 +415,67 @@ class StuntCVApp:
         if not self.playing and self.active_roi: self.process_and_display_frame()
         self.active_roi = None; self.drag_info = {}
 
+    def on_smoothing_update(self, val):
+        new_window_size = int(val)
+        # Re-initialize deques only if the size has actually changed
+        if not hasattr(self, 'base_history') or new_window_size != self.base_history.maxlen:
+            self.base_history = deque(maxlen=new_window_size)
+            self.flyer_history = deque(maxlen=new_window_size)
+
     def update_stats_panel(self, base_results, flyer_results, time_delta):
         h, w = self.video_height, self.video_width
         
-        # Base Velocity
         base_com = self.calculate_center_of_mass(base_results.pose_landmarks if base_results else None, w, h)
+        flyer_com = self.calculate_center_of_mass(flyer_results.pose_landmarks if flyer_results else None, w, h)
+
+        # Velocity
         if base_com and self.last_com_base and time_delta > 0:
-            dist_pixels = np.linalg.norm(np.array(base_com) - np.array(self.last_com_base))
-            velocity_pps = dist_pixels / time_delta # Pixels per second
-            self.base_velocity_var.set(f"Base Vel: {velocity_pps:.2f} pps")
-        else:
-            self.base_velocity_var.set("Base Vel: N/A")
+            self.base_velocity_var.set(f"Base Vel: {np.linalg.norm(np.array(base_com) - np.array(self.last_com_base)) / time_delta:.2f} pps")
+        else: self.base_velocity_var.set("Base Vel: N/A")
         self.last_com_base = base_com
 
-        # Flyer Velocity
-        flyer_com = self.calculate_center_of_mass(flyer_results.pose_landmarks if flyer_results else None, w, h)
         if flyer_com and self.last_com_flyer and time_delta > 0:
-            dist_pixels = np.linalg.norm(np.array(flyer_com) - np.array(self.last_com_flyer))
-            velocity_pps = dist_pixels / time_delta # Pixels per second
-            self.flyer_velocity_var.set(f"Flyer Vel: {velocity_pps:.2f} pps")
-        else:
-            self.flyer_velocity_var.set("Flyer Vel: N/A")
+            self.flyer_velocity_var.set(f"Flyer Vel: {np.linalg.norm(np.array(flyer_com) - np.array(self.last_com_flyer)) / time_delta:.2f} pps")
+        else: self.flyer_velocity_var.set("Flyer Vel: N/A")
         self.last_com_flyer = flyer_com
+
+        # Wobbliness
+        if base_com: self.base_com_history.append(base_com)
+        if flyer_com: self.flyer_com_history.append(flyer_com)
+        if len(self.base_com_history) > 5: # Need a few frames to calculate wobble
+            wobble = np.std([c[0] for c in self.base_com_history]) # Horizontal wobble
+            self.base_wobble_var.set(f"Base Wobble: {wobble:.2f}")
+        else: self.base_wobble_var.set("Base Wobble: N/A")
+        if len(self.flyer_com_history) > 5:
+            wobble = np.std([c[0] for c in self.flyer_com_history])
+            self.flyer_wobble_var.set(f"Flyer Wobble: {wobble:.2f}")
+        else: self.flyer_wobble_var.set("Flyer Wobble: N/A")
+
+        # Joint Alignment (Base)
+        if base_results and base_results.pose_landmarks:
+            lm = base_results.pose_landmarks.landmark
+            shoulder_x = (lm[11].x + lm[12].x) / 2
+            hip_x = (lm[23].x + lm[24].x) / 2
+            ankle_x = (lm[27].x + lm[28].x) / 2
+            alignment = (abs(shoulder_x - hip_x) + abs(hip_x - ankle_x)) * w
+            self.alignment_var.set(f"Alignment: {alignment:.2f} px")
+        else: self.alignment_var.set("Alignment: N/A")
+
+        # Plumb Line
+        if base_com and flyer_com:
+            plumb_line = abs(base_com[0] - flyer_com[0])
+            self.plumb_line_var.set(f"Plumb Line: {plumb_line:.2f} px")
+        else: self.plumb_line_var.set("Plumb Line: N/A")
+
+        # Stunt Score
+        if base_com and flyer_com and len(self.flyer_com_history) > 5:
+            flyer_height_score = (1 - flyer_com[1] / h) * 100 # Higher is better
+            flyer_wobble_score = max(0, 100 - np.std([c[0] for c in self.flyer_com_history]))
+            plumb_score = max(0, 100 - abs(base_com[0] - flyer_com[0]))
+            # Simple weighted average
+            score = (flyer_height_score * 0.4) + (flyer_wobble_score * 0.3) + (plumb_score * 0.3)
+            self.stunt_score_var.set(f"Stunt Score: {score:.1f}")
+        else: self.stunt_score_var.set("Stunt Score: N/A")
 
     def get_bounding_box(self, landmarks, w, h):
         x_coords = [lm.x * w for lm in landmarks]; y_coords = [lm.y * h for lm in landmarks]
@@ -486,7 +546,7 @@ class StuntCVApp:
         cap = cv2.VideoCapture(self.video_path)
         width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
         out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window), deque(maxlen=self.smoothing_window)
+        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window_var.get()), deque(maxlen=self.smoothing_window_var.get())
         last_base_results, last_flyer_results = None, None # Local tracker state for saving
         roi_enabled = self.roi_tracking_enabled.get()
         num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -533,7 +593,7 @@ class StuntCVApp:
         progress_dialog.geometry(f"+{self.root.winfo_x()+150}+{self.root.winfo_y()+150}")
         self.root.update_idletasks()
 
-        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window), deque(maxlen=self.smoothing_window)
+        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window_var.get()), deque(maxlen=self.smoothing_window_var.get())
         last_base_results, last_flyer_results = None, None # Local tracker state for saving
         roi_enabled = self.roi_tracking_enabled.get()
 
@@ -618,15 +678,38 @@ class StuntCVApp:
 
             viz_df = pd.DataFrame(com_data)
 
-            fig = px.line(viz_df, x='frame', y='com_y', color='person_id',
+            # Calculate Velocity and Acceleration
+            viz_df['y_velocity'] = viz_df.groupby('person_id')['com_y'].diff().fillna(0) / (1/self.cap.get(cv2.CAP_PROP_FPS))
+            viz_df['y_acceleration'] = viz_df.groupby('person_id')['y_velocity'].diff().fillna(0) / (1/self.cap.get(cv2.CAP_PROP_FPS))
+
+
+            fig_height = px.line(viz_df, x='frame', y='com_y', color='person_id',
                           title='Vertical Center of Mass Over Time',
                           labels={'frame': 'Frame Number', 'com_y': 'Vertical Position (Normalized)', 'person_id': 'Performer'},
                           color_discrete_map={'base': 'red', 'flyer': 'blue'})
-            
-            fig.update_layout(legend_title_text='Performer')
+            fig_height.update_layout(legend_title_text='Performer')
+
+            fig_vel = px.line(viz_df, x='frame', y='y_velocity', color='person_id',
+                          title='Vertical Velocity Over Time',
+                          labels={'frame': 'Frame Number', 'y_velocity': 'Vertical Velocity (pixels/sec)', 'person_id': 'Performer'},
+                          color_discrete_map={'base': 'red', 'flyer': 'blue'})
+            fig_vel.update_layout(legend_title_text='Performer')
+
+            fig_accel = px.line(viz_df, x='frame', y='y_acceleration', color='person_id',
+                          title='Vertical Acceleration Over Time',
+                          labels={'frame': 'Frame Number', 'y_acceleration': 'Vertical Acceleration (pixels/sec^2)', 'person_id': 'Performer'},
+                          color_discrete_map={'base': 'red', 'flyer': 'blue'})
+            fig_accel.update_layout(legend_title_text='Performer')
 
             html_path = os.path.splitext(csv_path)[0] + '_visualization.html'
-            fig.write_html(html_path)
+            with open(html_path, 'w') as f:
+                f.write("<html><head><title>Stunt Analysis</title></head><body>\n")
+                f.write("<h1 style='text-align: center;'>Stunt Performance Analysis</h1>\n")
+                f.write(fig_height.to_html(full_html=False, include_plotlyjs='cdn'))
+                f.write(fig_vel.to_html(full_html=False, include_plotlyjs=False))
+                f.write(fig_accel.to_html(full_html=False, include_plotlyjs=False))
+                f.write("</body></html>")
+
             messagebox.showinfo("Visualization Saved", f"Interactive visualization saved to {html_path}")
 
         except Exception as e:
