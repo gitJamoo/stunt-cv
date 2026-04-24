@@ -1,25 +1,57 @@
 import cv2
-import mediapipe as mp
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import numpy as np
 import csv
 from collections import deque
-from mediapipe.framework.formats import landmark_pb2
+from ultralytics import YOLO
 
 import pandas as pd
 import plotly.express as px
 import os
 
+# COCO 17-keypoint skeleton connections used for drawing
+YOLO_CONNECTIONS = [
+    (0, 1), (0, 2), (1, 3), (2, 4),    # face
+    (5, 6),                              # shoulders
+    (5, 7), (7, 9),                      # left arm
+    (6, 8), (8, 10),                     # right arm
+    (5, 11), (6, 12),                    # torso sides
+    (11, 12),                            # hips
+    (11, 13), (13, 15),                  # left leg
+    (12, 14), (14, 16),                  # right leg
+]
+
+# COCO keypoint indices used throughout stats calculations
+KP_L_SHOULDER, KP_R_SHOULDER = 5, 6
+KP_L_ELBOW,    KP_R_ELBOW    = 7, 8
+KP_L_WRIST,    KP_R_WRIST    = 9, 10
+KP_L_HIP,      KP_R_HIP      = 11, 12
+KP_L_KNEE,     KP_R_KNEE     = 13, 14
+KP_L_ANKLE,    KP_R_ANKLE    = 15, 16
+
+
+class Landmark:
+    __slots__ = ('x', 'y', 'visibility')
+    def __init__(self, x=0.0, y=0.0, visibility=0.0):
+        self.x = x
+        self.y = y
+        self.visibility = visibility
+
+class LandmarkList:
+    def __init__(self, landmarks):
+        self.landmark = landmarks
+
 class SmoothedResults:
     def __init__(self, landmarks):
         self.pose_landmarks = landmarks
 
+
 class StuntCVApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Stunt CV - ROI Tracking")
+        self.root.title("Stunt CV - YOLOv8 Tracking")
 
         # Core App State
         self.video_path = None
@@ -30,10 +62,8 @@ class StuntCVApp:
         self.current_frame_data = None
         self._resize_job = None
 
-        # MediaPipe Pose Setup
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
-        self.mp_drawing = mp.solutions.drawing_utils
+        # YOLOv8 Pose model — downloads yolov8n-pose.pt automatically on first run
+        self.yolo = YOLO('yolov8n-pose.pt')
 
         # UI-Controlled Tracking Parameters
         self.smoothing_window_var = tk.IntVar(value=10)
@@ -63,7 +93,7 @@ class StuntCVApp:
         self.last_com_base = None
         self.last_com_flyer = None
         self.last_frame_time = None
-        self.base_com_history = deque(maxlen=15) # For wobbliness calculation
+        self.base_com_history = deque(maxlen=15)
         self.flyer_com_history = deque(maxlen=15)
 
         # Stats UI Variables
@@ -78,7 +108,6 @@ class StuntCVApp:
         self.create_widgets()
 
     def create_widgets(self):
-        # Main content frame
         main_frame = tk.Frame(self.root)
         main_frame.pack(padx=5, pady=5)
 
@@ -94,7 +123,6 @@ class StuntCVApp:
 
         # Stats Panel
         self.stats_frame = tk.Frame(main_frame, bd=2, relief=tk.SUNKEN)
-        # Don't pack it yet, will be controlled by checkbox
 
         tk.Label(self.stats_frame, text="Live Stats", font=("Arial", 12, "bold")).pack(pady=5, padx=10)
         tk.Label(self.stats_frame, textvariable=self.base_velocity_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
@@ -104,7 +132,6 @@ class StuntCVApp:
         tk.Label(self.stats_frame, textvariable=self.alignment_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
         tk.Label(self.stats_frame, textvariable=self.plumb_line_var, font=("Arial", 10)).pack(pady=2, padx=10, anchor="w")
         tk.Label(self.stats_frame, textvariable=self.stunt_score_var, font=("Arial", 14, "bold"), fg="#0077c2").pack(pady=10, padx=10, anchor="center")
-
 
         self.canvas_middle.bind("<Button-1>", self.on_roi_press)
         self.canvas_middle.bind("<B1-Motion>", self.on_roi_drag)
@@ -127,7 +154,7 @@ class StuntCVApp:
         self.btn_save_csv.pack(side=tk.LEFT, padx=5)
         self.btn_save_viz = tk.Button(self.controls_frame, text="Save CSV + Viz", command=self.save_csv_and_viz)
         self.btn_save_viz.pack(side=tk.LEFT, padx=5)
-        
+
         self.chk_roi = tk.Checkbutton(self.controls_frame, text="Enable ROI Tracking", var=self.roi_tracking_enabled, command=self.on_roi_toggle)
         self.chk_roi.pack(side=tk.LEFT, padx=10)
         self.chk_base = tk.Checkbutton(self.controls_frame, text="Track Base", var=self.track_base, command=self.on_visibility_toggle)
@@ -137,7 +164,6 @@ class StuntCVApp:
         self.chk_stats = tk.Checkbutton(self.controls_frame, text="Show Stats", var=self.show_stats, command=self.on_visibility_toggle)
         self.chk_stats.pack(side=tk.LEFT, padx=10)
 
-        # Advanced Controls
         self.adv_controls_frame = tk.LabelFrame(self.root, text="Tracking Controls", padx=10, pady=10)
         self.adv_controls_frame.pack(padx=10, pady=5, fill=tk.X)
 
@@ -163,7 +189,7 @@ class StuntCVApp:
         if self.show_stats.get():
             avail_w -= self.stats_frame.winfo_width() + 10
 
-        canvas_w = (avail_w - 30) // 3  # 30 for inter-canvas padding
+        canvas_w = (avail_w - 30) // 3
         canvas_h = avail_h
 
         aspect = self.video_width / self.video_height
@@ -186,30 +212,29 @@ class StuntCVApp:
             self.process_and_display_frame()
 
     def open_video(self):
-        # Define the target directory for videos, create it if it doesn't exist
         videos_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'raw_videos')
         os.makedirs(videos_dir, exist_ok=True)
 
         self.video_path = filedialog.askopenfilename(
             initialdir=videos_dir,
             title="Select a video file",
-            filetypes=[("Video files", "*.mp4 *.avi")]
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.MOV")]
         )
         if not self.video_path: return
 
         self.playing = False
         self.base_history.clear(); self.flyer_history.clear()
-        self.last_base_results, self.last_flyer_results = None, None # Reset trackers
+        self.last_base_results, self.last_flyer_results = None, None
         self.cap = cv2.VideoCapture(self.video_path)
         self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.slider.config(to=self.total_frames - 1)
-        
+
         self.display_width = int(self.video_width * (self.display_height / self.video_height))
         for canvas in [self.canvas_left, self.canvas_middle, self.canvas_right]:
             canvas.config(width=self.display_width, height=self.display_height)
-        
+
         self.playing = True
         self.video_loop()
 
@@ -236,7 +261,7 @@ class StuntCVApp:
     def process_and_display_frame(self, time_delta=0):
         if self.current_frame_data is None: return
         frame = self.current_frame_data
-        
+
         original_frame = frame.copy()
         overlay_frame = frame.copy()
         pose_only_frame = np.zeros_like(frame)
@@ -289,16 +314,28 @@ class StuntCVApp:
         return base_results, flyer_results
 
     def process_single_roi(self, frame, roi):
-        h, w, _ = frame.shape
-        rx, ry, rw, rh = self.get_scaled_roi(roi, w, h)
-        if rx < w and ry < h:
-            crop = frame[ry:ry+rh, rx:rx+rw]
-            if crop.size > 0:
-                results = self.pose.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if results.pose_landmarks:
-                    self.translate_landmarks(results.pose_landmarks, rx, ry, rw, rh, w, h)
-                    return results
-        return None
+        fh, fw = frame.shape[:2]
+        rx, ry, rw, rh = self.get_scaled_roi(roi, fw, fh)
+        rx2, ry2 = min(rx + rw, fw), min(ry + rh, fh)
+        crop = frame[ry:ry2, rx:rx2]
+        if crop.size == 0:
+            return None
+        yolo_out = self.yolo(crop, verbose=False)[0]
+        if yolo_out.keypoints is None or len(yolo_out.boxes) == 0:
+            return None
+        best_i = int(yolo_out.boxes.conf.argmax())
+        kp_xyn = yolo_out.keypoints.xyn[best_i].cpu().numpy()
+        kp_conf = yolo_out.keypoints.conf[best_i].cpu().numpy()
+        lm_list = self._yolo_to_landmarks(kp_xyn, kp_conf)
+        self.translate_landmarks(lm_list, rx, ry, rx2 - rx, ry2 - ry, fw, fh)
+        return SmoothedResults(lm_list)
+
+    def _yolo_to_landmarks(self, kp_xyn, kp_conf):
+        """Convert YOLO normalized keypoints to a LandmarkList."""
+        return LandmarkList([
+            Landmark(x=float(kp_xyn[i][0]), y=float(kp_xyn[i][1]), visibility=float(kp_conf[i]))
+            for i in range(len(kp_xyn))
+        ])
 
     def _best_match(self, ref_lm, candidates, exclude, w, h):
         """Returns index of best matching pose using IoU with centroid-distance fallback."""
@@ -323,32 +360,25 @@ class StuntCVApp:
 
         if best_iou >= 0.3:
             return best_iou_idx
-        # Centroid fallback: accept if the nearest person is within 1.5x the last known body height.
-        # This handles fast toss/catch where boxes stop overlapping between frames.
+        # Centroid fallback: handles fast toss/catch where boxes stop overlapping between frames
         if best_cent_dist < ref_h * 1.5:
             return best_cent_idx
         return -1
 
     def _detect_poses_auto(self, frame, last_base_lm, last_flyer_lm):
-        """Stateless multi-person detection with IoU + centroid identity matching.
+        """Single-pass multi-person detection via YOLOv8.
         Returns (base_obj, flyer_obj, raw_base_lm, raw_flyer_lm)."""
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, _ = frame_rgb.shape
+        h, w = frame.shape[:2]
+        yolo_out = self.yolo(frame, verbose=False)[0]
 
-        # Detect up to 5 people by iteratively blacking out each found person.
-        # This ensures spotters don't prevent base/flyer from entering the candidate pool.
         detected_poses = []
-        frame_working = frame_rgb.copy()
-        for _ in range(5):
-            result = self.pose.process(frame_working).pose_landmarks
-            if not result:
-                break
-            detected_poses.append(result)
-            box = self.get_bounding_box(result.landmark, w, h)
-            cv2.rectangle(frame_working,
-                          (max(0, int(box[0]) - 10), max(0, int(box[1]) - 10)),
-                          (min(w, int(box[2]) + 10), min(h, int(box[3]) + 10)),
-                          (0, 0, 0), -1)
+        if yolo_out.keypoints is not None:
+            for i in range(len(yolo_out.boxes)):
+                if float(yolo_out.boxes.conf[i]) < 0.3:
+                    continue
+                kp_xyn = yolo_out.keypoints.xyn[i].cpu().numpy()
+                kp_conf = yolo_out.keypoints.conf[i].cpu().numpy()
+                detected_poses.append(self._yolo_to_landmarks(kp_xyn, kp_conf))
 
         current_base, current_flyer = None, None
 
@@ -372,20 +402,19 @@ class StuntCVApp:
                     if not current_base: current_base = pose
                     elif not current_flyer: current_flyer = pose
         else:
-            # First frame: pick extremes so spotters in the middle are ignored
+            # First frame: pick vertical extremes so spotters in the middle are ignored
             if len(detected_poses) == 1:
                 current_base = detected_poses[0]
             elif len(detected_poses) >= 2:
                 by_y = sorted(detected_poses, key=lambda p: sum(lm.y for lm in p.landmark))
                 current_flyer = by_y[0]   # smallest avg y = highest in frame
-                current_base = by_y[-1]   # largest avg y = lowest in frame
+                current_base  = by_y[-1]  # largest avg y = lowest in frame
 
-        # Preserve last known landmarks when a performer is temporarily lost so the
-        # next frame can attempt re-acquisition instead of resetting to first-frame logic.
-        new_base_lm = current_base if current_base else last_base_lm
+        # Preserve last known position on tracking loss so next frame can re-acquire
+        new_base_lm  = current_base  if current_base  else last_base_lm
         new_flyer_lm = current_flyer if current_flyer else last_flyer_lm
 
-        base_obj = SmoothedResults(current_base) if current_base else None
+        base_obj  = SmoothedResults(current_base)  if current_base  else None
         flyer_obj = SmoothedResults(current_flyer) if current_flyer else None
         return base_obj, flyer_obj, new_base_lm, new_flyer_lm
 
@@ -396,10 +425,23 @@ class StuntCVApp:
         return base_results, flyer_results
 
     def draw_classified_poses(self, frame, base_results, flyer_results):
-        if self.track_base.get() and base_results and base_results.pose_landmarks:
-            self.mp_drawing.draw_landmarks(frame, base_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=(0,0,255), thickness=2, circle_radius=2), connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(0,0,255), thickness=2))
-        if self.track_flyer.get() and flyer_results and flyer_results.pose_landmarks:
-            self.mp_drawing.draw_landmarks(frame, flyer_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=self.mp_drawing.DrawingSpec(color=(255,0,0), thickness=2, circle_radius=2), connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(255,0,0), thickness=2))
+        fh, fw = frame.shape[:2]
+        for results, color, enabled in [
+            (base_results,  (0, 0, 255), self.track_base.get()),
+            (flyer_results, (255, 0, 0), self.track_flyer.get()),
+        ]:
+            if not enabled or not results or not results.pose_landmarks:
+                continue
+            lm = results.pose_landmarks.landmark
+            for a, b in YOLO_CONNECTIONS:
+                if (a < len(lm) and b < len(lm)
+                        and lm[a].visibility > 0.5 and lm[b].visibility > 0.5):
+                    p1 = (int(lm[a].x * fw), int(lm[a].y * fh))
+                    p2 = (int(lm[b].x * fw), int(lm[b].y * fh))
+                    cv2.line(frame, p1, p2, color, 2)
+            for l in lm:
+                if l.visibility > 0.5:
+                    cv2.circle(frame, (int(l.x * fw), int(l.y * fh)), 3, color, -1)
 
     def on_slider_move(self, value):
         if self.cap and abs(self.cap.get(cv2.CAP_PROP_POS_FRAMES) - int(value)) > 1:
@@ -424,7 +466,6 @@ class StuntCVApp:
             self.stats_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y)
         else:
             self.stats_frame.pack_forget()
-
         if self.current_frame_data is not None:
             self.process_and_display_frame()
 
@@ -470,7 +511,6 @@ class StuntCVApp:
 
     def on_smoothing_update(self, val):
         new_window_size = int(val)
-        # Re-initialize deques only if the size has actually changed
         if not hasattr(self, 'base_history') or new_window_size != self.base_history.maxlen:
             self.base_history = deque(maxlen=new_window_size)
             self.flyer_history = deque(maxlen=new_window_size)
@@ -478,14 +518,14 @@ class StuntCVApp:
     def update_stats_panel(self, base_results, flyer_results, time_delta):
         h, w = self.video_height, self.video_width
 
-        base_lm = base_results.pose_landmarks if base_results else None
+        base_lm  = base_results.pose_landmarks  if base_results  else None
         flyer_lm = flyer_results.pose_landmarks if flyer_results else None
 
-        base_com = self.calculate_center_of_mass(base_lm, w, h)
-        flyer_com = self.calculate_center_of_mass(flyer_lm, w, h)
+        base_com   = self.calculate_center_of_mass(base_lm, w, h)
+        flyer_com  = self.calculate_center_of_mass(flyer_lm, w, h)
         base_torso = self.get_torso_length(base_lm, w, h)
         flyer_torso = self.get_torso_length(flyer_lm, w, h)
-        ref_torso = base_torso or flyer_torso  # shared scale reference
+        ref_torso  = base_torso or flyer_torso
 
         # Velocity in torso lengths / second — camera-distance invariant
         if base_com and self.last_com_base and time_delta > 0 and ref_torso:
@@ -520,18 +560,18 @@ class StuntCVApp:
         else:
             self.flyer_wobble_var.set("Flyer Wobble: N/A")
 
-        # Joint Alignment (Base): shoulder/hip/ankle stack deviation, normalized
+        # Joint Alignment (Base): shoulder/hip/ankle vertical stack deviation, normalized
         if base_lm and base_torso:
             lm = base_lm.landmark
-            shoulder_x = (lm[11].x + lm[12].x) / 2
-            hip_x = (lm[23].x + lm[24].x) / 2
-            ankle_x = (lm[27].x + lm[28].x) / 2
+            shoulder_x = (lm[KP_L_SHOULDER].x + lm[KP_R_SHOULDER].x) / 2
+            hip_x      = (lm[KP_L_HIP].x      + lm[KP_R_HIP].x)      / 2
+            ankle_x    = (lm[KP_L_ANKLE].x     + lm[KP_R_ANKLE].x)    / 2
             alignment_px = (abs(shoulder_x - hip_x) + abs(hip_x - ankle_x)) * w
             self.alignment_var.set(f"Alignment: {alignment_px / base_torso:.3f} TL")
         else:
             self.alignment_var.set("Alignment: N/A")
 
-        # Plumb Line: horizontal CoM offset, normalized
+        # Plumb Line: horizontal CoM offset between base and flyer, normalized
         if base_com and flyer_com and ref_torso:
             plumb = abs(base_com[0] - flyer_com[0]) / ref_torso
             self.plumb_line_var.set(f"Plumb Line: {plumb:.3f} TL")
@@ -542,9 +582,9 @@ class StuntCVApp:
         if base_com and flyer_com and len(self.flyer_com_history) > 5 and ref_torso:
             flyer_height_score = (1 - flyer_com[1] / h) * 100
             pts = np.array(list(self.flyer_com_history))
-            flyer_wobble_norm = np.mean(np.std(pts, axis=0)) / ref_torso
+            flyer_wobble_norm  = np.mean(np.std(pts, axis=0)) / ref_torso
             flyer_wobble_score = max(0, 100 - flyer_wobble_norm * 500)
-            plumb_norm = abs(base_com[0] - flyer_com[0]) / ref_torso
+            plumb_norm  = abs(base_com[0] - flyer_com[0]) / ref_torso
             plumb_score = max(0, 100 - plumb_norm * 100)
             score = (flyer_height_score * 0.4) + (flyer_wobble_score * 0.3) + (plumb_score * 0.3)
             self.stunt_score_var.set(f"Stunt Score: {score:.1f}")
@@ -552,38 +592,38 @@ class StuntCVApp:
             self.stunt_score_var.set("Stunt Score: N/A")
 
     def get_bounding_box(self, landmarks, w, h):
-        x_coords = [lm.x * w for lm in landmarks]; y_coords = [lm.y * h for lm in landmarks]
+        # Filter out undetected keypoints (YOLO returns 0,0 with conf~0)
+        pts = [(lm.x * w, lm.y * h) for lm in landmarks if lm.visibility > 0.3]
+        if not pts:
+            pts = [(lm.x * w, lm.y * h) for lm in landmarks]
+        x_coords, y_coords = zip(*pts)
         return min(x_coords), min(y_coords), max(x_coords), max(y_coords)
 
     def calculate_iou(self, box1, box2):
         x1_inter, y1_inter = max(box1[0], box2[0]), max(box1[1], box2[1])
         x2_inter, y2_inter = min(box1[2], box2[2]), min(box1[3], box2[3])
         inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
-        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1]); box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
         return inter_area / (box1_area + box2_area + 1e-6)
 
     def calculate_center_of_mass(self, landmarks, w, h):
         if not landmarks: return None
-        # A simple approximation of CoM using key body landmarks
-        # Weights can be adjusted for better accuracy
         com_indices = {
-            'torso_center': (11, 12, 23, 24), # Shoulders and Hips
-            'legs': (25, 26, 27, 28),
-            'arms': (13, 14, 15, 16)
+            'torso_center': (KP_L_SHOULDER, KP_R_SHOULDER, KP_L_HIP, KP_R_HIP),
+            'legs':         (KP_L_KNEE, KP_R_KNEE, KP_L_ANKLE, KP_R_ANKLE),
+            'arms':         (KP_L_ELBOW, KP_R_ELBOW, KP_L_WRIST, KP_R_WRIST),
         }
         total_weight = 0
         com_x, com_y = 0, 0
-        
-        for part, indices in com_indices.items():
-            weight = 1.0 # Simple weighting
+        for indices in com_indices.values():
             for idx in indices:
                 if idx < len(landmarks.landmark):
                     lm = landmarks.landmark[idx]
-                    if lm.visibility > 0.5: # Only include visible landmarks
-                        com_x += lm.x * w * weight
-                        com_y += lm.y * h * weight
-                        total_weight += weight
-        
+                    if lm.visibility > 0.5:
+                        com_x += lm.x * w
+                        com_y += lm.y * h
+                        total_weight += 1
         if total_weight == 0: return None
         return (com_x / total_weight, com_y / total_weight)
 
@@ -591,10 +631,10 @@ class StuntCVApp:
         """Pixel distance from avg shoulder to avg hip — used to normalize all stats."""
         if not landmarks: return None
         lm = landmarks.landmark
-        sx = (lm[11].x + lm[12].x) / 2 * w
-        sy = (lm[11].y + lm[12].y) / 2 * h
-        hx = (lm[23].x + lm[24].x) / 2 * w
-        hy = (lm[23].y + lm[24].y) / 2 * h
+        sx = (lm[KP_L_SHOULDER].x + lm[KP_R_SHOULDER].x) / 2 * w
+        sy = (lm[KP_L_SHOULDER].y + lm[KP_R_SHOULDER].y) / 2 * h
+        hx = (lm[KP_L_HIP].x      + lm[KP_R_HIP].x)      / 2 * w
+        hy = (lm[KP_L_HIP].y      + lm[KP_R_HIP].y)      / 2 * h
         length = np.hypot(sx - hx, sy - hy)
         return length if length > 0 else None
 
@@ -602,18 +642,26 @@ class StuntCVApp:
         scale_x, scale_y = frame_w / self.display_width, frame_h / self.display_height
         return int(roi["x"]*scale_x), int(roi["y"]*scale_y), int(roi["w"]*scale_x), int(roi["h"]*scale_y)
 
-    def translate_landmarks(self, landmarks, crop_x, crop_y, crop_w, crop_h, frame_w, frame_h):
-        for lm in landmarks.landmark: lm.x = (lm.x * crop_w + crop_x) / frame_w; lm.y = (lm.y * crop_h + crop_y) / frame_h
+    def translate_landmarks(self, lm_list, crop_x, crop_y, crop_w, crop_h, frame_w, frame_h):
+        for lm in lm_list.landmark:
+            lm.x = (lm.x * crop_w + crop_x) / frame_w
+            lm.y = (lm.y * crop_h + crop_y) / frame_h
 
     def smooth_pose(self, results, history):
-        if not results or not results.pose_landmarks: history.clear(); return None
+        if not results or not results.pose_landmarks:
+            history.clear()
+            return None
         history.append(results.pose_landmarks.landmark)
-        smoothed_list = landmark_pb2.NormalizedLandmarkList()
-        for i in range(len(history[0])):
-            avg_x = sum(frame[i].x for frame in history) / len(history); avg_y = sum(frame[i].y for frame in history) / len(history)
-            avg_z = sum(frame[i].z for frame in history) / len(history); avg_vis = sum(frame[i].visibility for frame in history) / len(history)
-            lm = smoothed_list.landmark.add(); lm.x, lm.y, lm.z, lm.visibility = avg_x, avg_y, avg_z, avg_vis
-        return SmoothedResults(smoothed_list)
+        n = len(history[0])
+        smoothed = [
+            Landmark(
+                x=sum(f[i].x for f in history) / len(history),
+                y=sum(f[i].y for f in history) / len(history),
+                visibility=sum(f[i].visibility for f in history) / len(history),
+            )
+            for i in range(n)
+        ]
+        return SmoothedResults(LandmarkList(smoothed))
 
     def save_video(self):
         if not self.video_path: messagebox.showwarning("No Video", "Please open a video file first."); return
@@ -634,7 +682,7 @@ class StuntCVApp:
         width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
         out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
         save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window_var.get()), deque(maxlen=self.smoothing_window_var.get())
-        last_base_results, last_flyer_results = None, None # Local tracker state for saving
+        last_base_results, last_flyer_results = None, None
         roi_enabled = self.roi_tracking_enabled.get()
         num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         progress_dialog = tk.Toplevel(self.root); progress_dialog.title("Saving...")
@@ -644,14 +692,10 @@ class StuntCVApp:
             ret, frame = cap.read()
             if not ret: break
             output_frame = np.zeros_like(frame) if mocap_only else frame.copy()
-            
-            # Use a local tracking state for the save process
             if roi_enabled:
                 base_results, flyer_results = self.find_poses_by_roi(frame)
             else:
-                # We need to replicate the tracking logic here for the save process
                 base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
-
             smoothed_base, smoothed_flyer = self.smooth_pose(base_results, save_base_hist), self.smooth_pose(flyer_results, save_flyer_hist)
             self.draw_classified_poses(output_frame, smoothed_base, smoothed_flyer)
             out.write(output_frame)
@@ -681,45 +725,42 @@ class StuntCVApp:
         self.root.update_idletasks()
 
         save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window_var.get()), deque(maxlen=self.smoothing_window_var.get())
-        last_base_results, last_flyer_results = None, None # Local tracker state for saving
+        last_base_results, last_flyer_results = None, None
         roi_enabled = self.roi_tracking_enabled.get()
 
         with open(save_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            header = ['frame', 'person_id', 'landmark', 'x', 'y', 'z', 'visibility']
-            writer.writerow(header)
+            writer.writerow(['frame', 'person_id', 'landmark', 'x', 'y', 'visibility'])
 
             for i in range(num_frames):
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 if roi_enabled:
                     base_results, flyer_results = self.find_poses_by_roi(frame)
                 else:
                     base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
 
-                smoothed_base = self.smooth_pose(base_results, save_base_hist)
+                smoothed_base  = self.smooth_pose(base_results, save_base_hist)
                 smoothed_flyer = self.smooth_pose(flyer_results, save_flyer_hist)
 
                 for person_id, results in [('base', smoothed_base), ('flyer', smoothed_flyer)]:
                     if results and results.pose_landmarks:
                         for j, lm in enumerate(results.pose_landmarks.landmark):
-                            writer.writerow([i, person_id, j, lm.x, lm.y, lm.z, lm.visibility])
-                
+                            writer.writerow([i, person_id, j, lm.x, lm.y, lm.visibility])
+
                 progress_label.config(text=f"Processing frame {i+1}/{num_frames}")
                 self.root.update_idletasks()
 
         cap.release()
         progress_dialog.destroy()
         messagebox.showinfo("Save Complete", f"CSV data saved to {save_path}")
-        return save_path # Return path on success
+        return save_path
 
     def save_csv_and_viz(self):
         if not self.video_path:
             messagebox.showwarning("No Video", "Please open a video file first.")
             return
-        
         csv_path = self._execute_csv_save()
         if csv_path:
             self._generate_visualization(csv_path)
@@ -731,62 +772,45 @@ class StuntCVApp:
                 messagebox.showwarning("Empty Data", "The CSV file is empty, cannot generate visualization.")
                 return
 
-            # Calculate CoM for each frame from the raw landmark data
+            com_indices = {
+                'torso_center': (KP_L_SHOULDER, KP_R_SHOULDER, KP_L_HIP, KP_R_HIP),
+                'legs':         (KP_L_KNEE, KP_R_KNEE, KP_L_ANKLE, KP_R_ANKLE),
+                'arms':         (KP_L_ELBOW, KP_R_ELBOW, KP_L_WRIST, KP_R_WRIST),
+            }
+            all_indices = [idx for indices in com_indices.values() for idx in indices]
+
             com_data = []
             for frame_num, frame_df in df.groupby('frame'):
                 for person_id, person_df in frame_df.groupby('person_id'):
-                    # Use the same CoM logic as the live stats
-                    com_indices = {
-                        'torso_center': (11, 12, 23, 24), # Shoulders and Hips
-                        'legs': (25, 26, 27, 28),
-                        'arms': (13, 14, 15, 16)
-                    }
-                    total_weight = 0
-                    com_x, com_y = 0, 0
-                    for part, indices in com_indices.items():
-                        weight = 1.0
-                        for idx in indices:
-                            lm = person_df[person_df['landmark'] == idx]
-                            if not lm.empty and lm['visibility'].iloc[0] > 0.5:
-                                com_x += lm['x'].iloc[0] * weight
-                                com_y += lm['y'].iloc[0] * weight
-                                total_weight += weight
-                    
+                    total_weight, com_x, com_y = 0, 0, 0
+                    for idx in all_indices:
+                        lm = person_df[person_df['landmark'] == idx]
+                        if not lm.empty and lm['visibility'].iloc[0] > 0.5:
+                            com_x += lm['x'].iloc[0]
+                            com_y += lm['y'].iloc[0]
+                            total_weight += 1
                     if total_weight > 0:
                         com_data.append({
                             'frame': frame_num,
                             'person_id': person_id,
-                            'com_y': 1 - (com_y / total_weight) # Invert Y-axis for intuitive plotting (0 at bottom)
+                            'com_y': 1 - (com_y / total_weight)
                         })
-            
+
             if not com_data:
                 messagebox.showwarning("No Data", "Could not calculate Center of Mass from the data.")
                 return
 
             viz_df = pd.DataFrame(com_data)
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            viz_df['y_velocity']     = viz_df.groupby('person_id')['com_y'].diff().fillna(0) * fps
+            viz_df['y_acceleration'] = viz_df.groupby('person_id')['y_velocity'].diff().fillna(0) * fps
 
-            # Calculate Velocity and Acceleration
-            viz_df['y_velocity'] = viz_df.groupby('person_id')['com_y'].diff().fillna(0) / (1/self.cap.get(cv2.CAP_PROP_FPS))
-            viz_df['y_acceleration'] = viz_df.groupby('person_id')['y_velocity'].diff().fillna(0) / (1/self.cap.get(cv2.CAP_PROP_FPS))
-
-
-            fig_height = px.line(viz_df, x='frame', y='com_y', color='person_id',
-                          title='Vertical Center of Mass Over Time',
-                          labels={'frame': 'Frame Number', 'com_y': 'Vertical Position (Normalized)', 'person_id': 'Performer'},
-                          color_discrete_map={'base': 'red', 'flyer': 'blue'})
-            fig_height.update_layout(legend_title_text='Performer')
-
-            fig_vel = px.line(viz_df, x='frame', y='y_velocity', color='person_id',
-                          title='Vertical Velocity Over Time',
-                          labels={'frame': 'Frame Number', 'y_velocity': 'Vertical Velocity (pixels/sec)', 'person_id': 'Performer'},
-                          color_discrete_map={'base': 'red', 'flyer': 'blue'})
-            fig_vel.update_layout(legend_title_text='Performer')
-
-            fig_accel = px.line(viz_df, x='frame', y='y_acceleration', color='person_id',
-                          title='Vertical Acceleration Over Time',
-                          labels={'frame': 'Frame Number', 'y_acceleration': 'Vertical Acceleration (pixels/sec^2)', 'person_id': 'Performer'},
-                          color_discrete_map={'base': 'red', 'flyer': 'blue'})
-            fig_accel.update_layout(legend_title_text='Performer')
+            color_map = {'base': 'red', 'flyer': 'blue'}
+            fig_height = px.line(viz_df, x='frame', y='com_y',      color='person_id', title='Vertical Center of Mass Over Time',  labels={'frame': 'Frame', 'com_y': 'Vertical Position (Normalized)'}, color_discrete_map=color_map)
+            fig_vel    = px.line(viz_df, x='frame', y='y_velocity',  color='person_id', title='Vertical Velocity Over Time',         labels={'frame': 'Frame', 'y_velocity': 'Velocity (normalized/s)'},   color_discrete_map=color_map)
+            fig_accel  = px.line(viz_df, x='frame', y='y_acceleration', color='person_id', title='Vertical Acceleration Over Time', labels={'frame': 'Frame', 'y_acceleration': 'Acceleration (normalized/s²)'}, color_discrete_map=color_map)
+            for fig in [fig_height, fig_vel, fig_accel]:
+                fig.update_layout(legend_title_text='Performer')
 
             html_path = os.path.splitext(csv_path)[0] + '_visualization.html'
             with open(html_path, 'w') as f:
@@ -804,6 +828,7 @@ class StuntCVApp:
 
     def _find_poses_auto_for_save(self, frame, last_base, last_flyer):
         return self._detect_poses_auto(frame, last_base, last_flyer)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
