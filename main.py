@@ -61,6 +61,7 @@ class StuntCVApp:
         self.display_width, self.display_height = 480, 360
         self.current_frame_data = None
         self._resize_job = None
+        self._last_detected_poses = []  # all people detected last frame, for click-to-assign
 
         # YOLOv8 Pose model — downloads yolov8n-pose.pt automatically on first run
         self.yolo = YOLO('yolov8n-pose.pt')
@@ -136,6 +137,7 @@ class StuntCVApp:
         self.canvas_middle.bind("<Button-1>", self.on_roi_press)
         self.canvas_middle.bind("<B1-Motion>", self.on_roi_drag)
         self.canvas_middle.bind("<ButtonRelease-1>", self.on_roi_release)
+        self.canvas_middle.bind("<Button-3>", self.on_canvas_right_click)
         self.root.bind("<Configure>", self.on_window_resize)
 
         self.slider = tk.Scale(self.root, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_slider_move)
@@ -154,6 +156,8 @@ class StuntCVApp:
         self.btn_save_csv.pack(side=tk.LEFT, padx=5)
         self.btn_save_viz = tk.Button(self.controls_frame, text="Save CSV + Viz", command=self.save_csv_and_viz)
         self.btn_save_viz.pack(side=tk.LEFT, padx=5)
+        self.btn_swap = tk.Button(self.controls_frame, text="Swap Base/Flyer", command=self.swap_roles)
+        self.btn_swap.pack(side=tk.LEFT, padx=5)
 
         self.chk_roi = tk.Checkbutton(self.controls_frame, text="Enable ROI Tracking", var=self.roi_tracking_enabled, command=self.on_roi_toggle)
         self.chk_roi.pack(side=tk.LEFT, padx=10)
@@ -379,6 +383,7 @@ class StuntCVApp:
                 kp_xyn = yolo_out.keypoints.xyn[i].cpu().numpy()
                 kp_conf = yolo_out.keypoints.conf[i].cpu().numpy()
                 detected_poses.append(self._yolo_to_landmarks(kp_xyn, kp_conf))
+        self._last_detected_poses = detected_poses
 
         current_base, current_flyer = None, None
 
@@ -438,10 +443,53 @@ class StuntCVApp:
                         and lm[a].visibility > 0.5 and lm[b].visibility > 0.5):
                     p1 = (int(lm[a].x * fw), int(lm[a].y * fh))
                     p2 = (int(lm[b].x * fw), int(lm[b].y * fh))
-                    cv2.line(frame, p1, p2, color, 2)
-            for l in lm:
-                if l.visibility > 0.5:
-                    cv2.circle(frame, (int(l.x * fw), int(l.y * fh)), 3, color, -1)
+                    cv2.line(frame, p1, p2, color, 3, cv2.LINE_AA)
+
+    def on_canvas_right_click(self, event):
+        if not self._last_detected_poses:
+            return
+        # Find the detected person whose centroid is closest to the click
+        nx, ny = event.x / self.display_width, event.y / self.display_height
+        best_idx, best_dist = -1, float('inf')
+        for i, pose in enumerate(self._last_detected_poses):
+            visible = [lm for lm in pose.landmark if lm.visibility > 0.3]
+            if not visible:
+                continue
+            cx = sum(lm.x for lm in visible) / len(visible)
+            cy = sum(lm.y for lm in visible) / len(visible)
+            dist = np.hypot(cx - nx, cy - ny)
+            if dist < best_dist:
+                best_dist, best_idx = dist, i
+        if best_idx == -1:
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Set as Base",  command=lambda: self._assign_role(best_idx, 'base'))
+        menu.add_command(label="Set as Flyer", command=lambda: self._assign_role(best_idx, 'flyer'))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _assign_role(self, pose_idx, role):
+        if pose_idx >= len(self._last_detected_poses):
+            return
+        pose = self._last_detected_poses[pose_idx]
+        if role == 'base':
+            self.last_base_results = pose
+        else:
+            self.last_flyer_results = pose
+        # Clear smoothing history so the new assignment doesn't blend with the old person
+        self.base_history.clear()
+        self.flyer_history.clear()
+        if not self.playing and self.current_frame_data is not None:
+            self.process_and_display_frame()
+
+    def swap_roles(self):
+        self.last_base_results, self.last_flyer_results = self.last_flyer_results, self.last_base_results
+        self.base_history.clear()
+        self.flyer_history.clear()
+        if self.current_frame_data is not None:
+            self.process_and_display_frame()
 
     def on_slider_move(self, value):
         if self.cap and abs(self.cap.get(cv2.CAP_PROP_POS_FRAMES) - int(value)) > 1:
