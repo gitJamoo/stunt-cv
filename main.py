@@ -28,6 +28,7 @@ class StuntCVApp:
         self.video_width, self.video_height, self.total_frames = 0, 0, 0
         self.display_width, self.display_height = 480, 360
         self.current_frame_data = None
+        self._resize_job = None
 
         # MediaPipe Pose Setup
         self.mp_pose = mp.solutions.pose
@@ -108,6 +109,7 @@ class StuntCVApp:
         self.canvas_middle.bind("<Button-1>", self.on_roi_press)
         self.canvas_middle.bind("<B1-Motion>", self.on_roi_drag)
         self.canvas_middle.bind("<ButtonRelease-1>", self.on_roi_release)
+        self.root.bind("<Configure>", self.on_window_resize)
 
         self.slider = tk.Scale(self.root, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_slider_move)
         self.slider.pack(fill=tk.X, padx=10, pady=5)
@@ -142,6 +144,46 @@ class StuntCVApp:
         tk.Label(self.adv_controls_frame, text="Smoothing:").pack(side=tk.LEFT, padx=(0, 5))
         self.smoothing_slider = tk.Scale(self.adv_controls_frame, from_=1, to=30, orient=tk.HORIZONTAL, variable=self.smoothing_window_var, command=self.on_smoothing_update)
         self.smoothing_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def on_window_resize(self, event):
+        if event.widget is not self.root or not self.video_path:
+            return
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(100, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_job = None
+        bottom_h = (self.slider.winfo_height() +
+                    self.controls_frame.winfo_height() +
+                    self.adv_controls_frame.winfo_height() + 30)
+        avail_w = self.root.winfo_width() - 20
+        avail_h = self.root.winfo_height() - bottom_h - 20
+
+        if self.show_stats.get():
+            avail_w -= self.stats_frame.winfo_width() + 10
+
+        canvas_w = (avail_w - 30) // 3  # 30 for inter-canvas padding
+        canvas_h = avail_h
+
+        aspect = self.video_width / self.video_height
+        if canvas_w / max(canvas_h, 1) > aspect:
+            canvas_w = int(canvas_h * aspect)
+        else:
+            canvas_h = int(canvas_w / aspect)
+
+        if canvas_w < 100 or canvas_h < 100:
+            return
+        if canvas_w == self.display_width and canvas_h == self.display_height:
+            return
+
+        self.display_width = canvas_w
+        self.display_height = canvas_h
+        for canvas in [self.canvas_left, self.canvas_middle, self.canvas_right]:
+            canvas.config(width=self.display_width, height=self.display_height)
+
+        if not self.playing and self.current_frame_data is not None:
+            self.process_and_display_frame()
 
     def open_video(self):
         # Define the target directory for videos, create it if it doesn't exist
@@ -258,97 +300,100 @@ class StuntCVApp:
                     return results
         return None
 
-    def find_poses_auto(self, frame):
+    def _best_match(self, ref_lm, candidates, exclude, w, h):
+        """Returns index of best matching pose using IoU with centroid-distance fallback."""
+        ref_box = self.get_bounding_box(ref_lm.landmark, w, h)
+        ref_cx = (ref_box[0] + ref_box[2]) / 2
+        ref_cy = (ref_box[1] + ref_box[3]) / 2
+        ref_h = max(ref_box[3] - ref_box[1], 1)
+
+        best_iou_idx, best_iou = -1, 0.0
+        best_cent_idx, best_cent_dist = -1, float('inf')
+
+        for i, pose in enumerate(candidates):
+            if i in exclude:
+                continue
+            box = self.get_bounding_box(pose.landmark, w, h)
+            iou = self.calculate_iou(ref_box, box)
+            if iou > best_iou:
+                best_iou, best_iou_idx = iou, i
+            dist = np.hypot((box[0] + box[2]) / 2 - ref_cx, (box[1] + box[3]) / 2 - ref_cy)
+            if dist < best_cent_dist:
+                best_cent_dist, best_cent_idx = dist, i
+
+        if best_iou >= 0.3:
+            return best_iou_idx
+        # Centroid fallback: accept if the nearest person is within 1.5x the last known body height.
+        # This handles fast toss/catch where boxes stop overlapping between frames.
+        if best_cent_dist < ref_h * 1.5:
+            return best_cent_idx
+        return -1
+
+    def _detect_poses_auto(self, frame, last_base_lm, last_flyer_lm):
+        """Stateless multi-person detection with IoU + centroid identity matching.
+        Returns (base_obj, flyer_obj, raw_base_lm, raw_flyer_lm)."""
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, _ = frame_rgb.shape
-        all_results = self.pose.process(frame_rgb).pose_landmarks
 
-        # This is a simplified stand-in for a multi-pose detection model.
-        # We process the frame once, then blank out the first person and process again.
+        # Detect up to 5 people by iteratively blacking out each found person.
+        # This ensures spotters don't prevent base/flyer from entering the candidate pool.
         detected_poses = []
-        if all_results:
-            detected_poses.append(all_results)
-            frame_rgb_copy = np.copy(frame_rgb)
-            box1 = self.get_bounding_box(all_results.landmark, w, h)
-            cv2.rectangle(frame_rgb_copy, (int(box1[0])-10, int(box1[1])-10), (int(box1[2])+10, int(box1[3])+10), (0,0,0), -1)
-            
-            second_results = self.pose.process(frame_rgb_copy).pose_landmarks
-            if second_results:
-                box2 = self.get_bounding_box(second_results.landmark, w, h)
-                # Simple check to ensure the second person is reasonably distinct
-                if self.calculate_iou(box1, box2) < 0.1:
-                    detected_poses.append(second_results)
+        frame_working = frame_rgb.copy()
+        for _ in range(5):
+            result = self.pose.process(frame_working).pose_landmarks
+            if not result:
+                break
+            detected_poses.append(result)
+            box = self.get_bounding_box(result.landmark, w, h)
+            cv2.rectangle(frame_working,
+                          (max(0, int(box[0]) - 10), max(0, int(box[1]) - 10)),
+                          (min(w, int(box[2]) + 10), min(h, int(box[3]) + 10)),
+                          (0, 0, 0), -1)
 
         current_base, current_flyer = None, None
 
-        # If we have previous tracking data, use it to match
-        if self.last_base_results or self.last_flyer_results:
+        if last_base_lm or last_flyer_lm:
             matched_indices = set()
 
-            # Match for Base
-            if self.last_base_results:
-                last_box = self.get_bounding_box(self.last_base_results.landmark, w, h)
-                best_match_idx, best_iou = -1, 0
-                for i, pose in enumerate(detected_poses):
-                    current_box = self.get_bounding_box(pose.landmark, w, h)
-                    iou = self.calculate_iou(last_box, current_box)
-                    if i not in matched_indices and iou > best_iou:
-                        best_iou = iou
-                        best_match_idx = i
-                if best_match_idx != -1 and best_iou > 0.1: # Threshold for a valid match
-                    current_base = detected_poses[best_match_idx]
-                    matched_indices.add(best_match_idx)
+            if last_base_lm:
+                idx = self._best_match(last_base_lm, detected_poses, matched_indices, w, h)
+                if idx != -1:
+                    current_base = detected_poses[idx]
+                    matched_indices.add(idx)
 
-            # Match for Flyer
-            if self.last_flyer_results:
-                last_box = self.get_bounding_box(self.last_flyer_results.landmark, w, h)
-                best_match_idx, best_iou = -1, 0
-                for i, pose in enumerate(detected_poses):
-                    if i in matched_indices: continue
-                    current_box = self.get_bounding_box(pose.landmark, w, h)
-                    iou = self.calculate_iou(last_box, current_box)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_match_idx = i
-                if best_match_idx != -1 and best_iou > 0.1:
-                    current_flyer = detected_poses[best_match_idx]
-                    matched_indices.add(best_match_idx)
-            
-            # Assign any remaining poses
+            if last_flyer_lm:
+                idx = self._best_match(last_flyer_lm, detected_poses, matched_indices, w, h)
+                if idx != -1:
+                    current_flyer = detected_poses[idx]
+                    matched_indices.add(idx)
+
             for i, pose in enumerate(detected_poses):
                 if i not in matched_indices:
-                    if not current_base:
-                        current_base = pose
-                    elif not current_flyer:
-                        current_flyer = pose
-
-        # If no tracking data, use vertical position as a fallback for the first frame
+                    if not current_base: current_base = pose
+                    elif not current_flyer: current_flyer = pose
         else:
+            # First frame: pick extremes so spotters in the middle are ignored
             if len(detected_poses) == 1:
                 current_base = detected_poses[0]
-            elif len(detected_poses) == 2:
-                avg_y1 = sum(lm.y for lm in detected_poses[0].landmark)
-                avg_y2 = sum(lm.y for lm in detected_poses[1].landmark)
-                if avg_y1 > avg_y2:
-                    current_base, current_flyer = detected_poses[0], detected_poses[1]
-                else:
-                    current_base, current_flyer = detected_poses[1], detected_poses[0]
+            elif len(detected_poses) >= 2:
+                by_y = sorted(detected_poses, key=lambda p: sum(lm.y for lm in p.landmark))
+                current_flyer = by_y[0]   # smallest avg y = highest in frame
+                current_base = by_y[-1]   # largest avg y = lowest in frame
 
-        # Wrap results in the expected class structure and update state
-        base_results_obj, flyer_results_obj = None, None
-        if current_base:
-            base_results_obj = SmoothedResults(current_base)
-            self.last_base_results = current_base
-        else:
-            self.last_base_results = None
+        # Preserve last known landmarks when a performer is temporarily lost so the
+        # next frame can attempt re-acquisition instead of resetting to first-frame logic.
+        new_base_lm = current_base if current_base else last_base_lm
+        new_flyer_lm = current_flyer if current_flyer else last_flyer_lm
 
-        if current_flyer:
-            flyer_results_obj = SmoothedResults(current_flyer)
-            self.last_flyer_results = current_flyer
-        else:
-            self.last_flyer_results = None
+        base_obj = SmoothedResults(current_base) if current_base else None
+        flyer_obj = SmoothedResults(current_flyer) if current_flyer else None
+        return base_obj, flyer_obj, new_base_lm, new_flyer_lm
 
-        return base_results_obj, flyer_results_obj
+    def find_poses_auto(self, frame):
+        base_results, flyer_results, self.last_base_results, self.last_flyer_results = self._detect_poses_auto(
+            frame, self.last_base_results, self.last_flyer_results
+        )
+        return base_results, flyer_results
 
     def draw_classified_poses(self, frame, base_results, flyer_results):
         if self.track_base.get() and base_results and base_results.pose_landmarks:
@@ -432,58 +477,79 @@ class StuntCVApp:
 
     def update_stats_panel(self, base_results, flyer_results, time_delta):
         h, w = self.video_height, self.video_width
-        
-        base_com = self.calculate_center_of_mass(base_results.pose_landmarks if base_results else None, w, h)
-        flyer_com = self.calculate_center_of_mass(flyer_results.pose_landmarks if flyer_results else None, w, h)
 
-        # Velocity
-        if base_com and self.last_com_base and time_delta > 0:
-            self.base_velocity_var.set(f"Base Vel: {np.linalg.norm(np.array(base_com) - np.array(self.last_com_base)) / time_delta:.2f} pps")
-        else: self.base_velocity_var.set("Base Vel: N/A")
+        base_lm = base_results.pose_landmarks if base_results else None
+        flyer_lm = flyer_results.pose_landmarks if flyer_results else None
+
+        base_com = self.calculate_center_of_mass(base_lm, w, h)
+        flyer_com = self.calculate_center_of_mass(flyer_lm, w, h)
+        base_torso = self.get_torso_length(base_lm, w, h)
+        flyer_torso = self.get_torso_length(flyer_lm, w, h)
+        ref_torso = base_torso or flyer_torso  # shared scale reference
+
+        # Velocity in torso lengths / second — camera-distance invariant
+        if base_com and self.last_com_base and time_delta > 0 and ref_torso:
+            vel = np.linalg.norm(np.array(base_com) - np.array(self.last_com_base)) / time_delta / ref_torso
+            self.base_velocity_var.set(f"Base Vel: {vel:.2f} TL/s")
+        else:
+            self.base_velocity_var.set("Base Vel: N/A")
         self.last_com_base = base_com
 
-        if flyer_com and self.last_com_flyer and time_delta > 0:
-            self.flyer_velocity_var.set(f"Flyer Vel: {np.linalg.norm(np.array(flyer_com) - np.array(self.last_com_flyer)) / time_delta:.2f} pps")
-        else: self.flyer_velocity_var.set("Flyer Vel: N/A")
+        if flyer_com and self.last_com_flyer and time_delta > 0 and ref_torso:
+            vel = np.linalg.norm(np.array(flyer_com) - np.array(self.last_com_flyer)) / time_delta / ref_torso
+            self.flyer_velocity_var.set(f"Flyer Vel: {vel:.2f} TL/s")
+        else:
+            self.flyer_velocity_var.set("Flyer Vel: N/A")
         self.last_com_flyer = flyer_com
 
-        # Wobbliness
+        # 2D wobble: std dev across both axes, normalized by torso length
         if base_com: self.base_com_history.append(base_com)
         if flyer_com: self.flyer_com_history.append(flyer_com)
-        if len(self.base_com_history) > 5: # Need a few frames to calculate wobble
-            wobble = np.std([c[0] for c in self.base_com_history]) # Horizontal wobble
-            self.base_wobble_var.set(f"Base Wobble: {wobble:.2f}")
-        else: self.base_wobble_var.set("Base Wobble: N/A")
-        if len(self.flyer_com_history) > 5:
-            wobble = np.std([c[0] for c in self.flyer_com_history])
-            self.flyer_wobble_var.set(f"Flyer Wobble: {wobble:.2f}")
-        else: self.flyer_wobble_var.set("Flyer Wobble: N/A")
 
-        # Joint Alignment (Base)
-        if base_results and base_results.pose_landmarks:
-            lm = base_results.pose_landmarks.landmark
+        if len(self.base_com_history) > 5 and ref_torso:
+            pts = np.array(list(self.base_com_history))
+            wobble = np.mean(np.std(pts, axis=0)) / ref_torso
+            self.base_wobble_var.set(f"Base Wobble: {wobble:.3f} TL")
+        else:
+            self.base_wobble_var.set("Base Wobble: N/A")
+
+        if len(self.flyer_com_history) > 5 and ref_torso:
+            pts = np.array(list(self.flyer_com_history))
+            wobble = np.mean(np.std(pts, axis=0)) / ref_torso
+            self.flyer_wobble_var.set(f"Flyer Wobble: {wobble:.3f} TL")
+        else:
+            self.flyer_wobble_var.set("Flyer Wobble: N/A")
+
+        # Joint Alignment (Base): shoulder/hip/ankle stack deviation, normalized
+        if base_lm and base_torso:
+            lm = base_lm.landmark
             shoulder_x = (lm[11].x + lm[12].x) / 2
             hip_x = (lm[23].x + lm[24].x) / 2
             ankle_x = (lm[27].x + lm[28].x) / 2
-            alignment = (abs(shoulder_x - hip_x) + abs(hip_x - ankle_x)) * w
-            self.alignment_var.set(f"Alignment: {alignment:.2f} px")
-        else: self.alignment_var.set("Alignment: N/A")
+            alignment_px = (abs(shoulder_x - hip_x) + abs(hip_x - ankle_x)) * w
+            self.alignment_var.set(f"Alignment: {alignment_px / base_torso:.3f} TL")
+        else:
+            self.alignment_var.set("Alignment: N/A")
 
-        # Plumb Line
-        if base_com and flyer_com:
-            plumb_line = abs(base_com[0] - flyer_com[0])
-            self.plumb_line_var.set(f"Plumb Line: {plumb_line:.2f} px")
-        else: self.plumb_line_var.set("Plumb Line: N/A")
+        # Plumb Line: horizontal CoM offset, normalized
+        if base_com and flyer_com and ref_torso:
+            plumb = abs(base_com[0] - flyer_com[0]) / ref_torso
+            self.plumb_line_var.set(f"Plumb Line: {plumb:.3f} TL")
+        else:
+            self.plumb_line_var.set("Plumb Line: N/A")
 
-        # Stunt Score
-        if base_com and flyer_com and len(self.flyer_com_history) > 5:
-            flyer_height_score = (1 - flyer_com[1] / h) * 100 # Higher is better
-            flyer_wobble_score = max(0, 100 - np.std([c[0] for c in self.flyer_com_history]))
-            plumb_score = max(0, 100 - abs(base_com[0] - flyer_com[0]))
-            # Simple weighted average
+        # Stunt Score: all components normalized so it's camera-invariant
+        if base_com and flyer_com and len(self.flyer_com_history) > 5 and ref_torso:
+            flyer_height_score = (1 - flyer_com[1] / h) * 100
+            pts = np.array(list(self.flyer_com_history))
+            flyer_wobble_norm = np.mean(np.std(pts, axis=0)) / ref_torso
+            flyer_wobble_score = max(0, 100 - flyer_wobble_norm * 500)
+            plumb_norm = abs(base_com[0] - flyer_com[0]) / ref_torso
+            plumb_score = max(0, 100 - plumb_norm * 100)
             score = (flyer_height_score * 0.4) + (flyer_wobble_score * 0.3) + (plumb_score * 0.3)
             self.stunt_score_var.set(f"Stunt Score: {score:.1f}")
-        else: self.stunt_score_var.set("Stunt Score: N/A")
+        else:
+            self.stunt_score_var.set("Stunt Score: N/A")
 
     def get_bounding_box(self, landmarks, w, h):
         x_coords = [lm.x * w for lm in landmarks]; y_coords = [lm.y * h for lm in landmarks]
@@ -520,6 +586,17 @@ class StuntCVApp:
         
         if total_weight == 0: return None
         return (com_x / total_weight, com_y / total_weight)
+
+    def get_torso_length(self, landmarks, w, h):
+        """Pixel distance from avg shoulder to avg hip — used to normalize all stats."""
+        if not landmarks: return None
+        lm = landmarks.landmark
+        sx = (lm[11].x + lm[12].x) / 2 * w
+        sy = (lm[11].y + lm[12].y) / 2 * h
+        hx = (lm[23].x + lm[24].x) / 2 * w
+        hy = (lm[23].y + lm[24].y) / 2 * h
+        length = np.hypot(sx - hx, sy - hy)
+        return length if length > 0 else None
 
     def get_scaled_roi(self, roi, frame_w, frame_h):
         scale_x, scale_y = frame_w / self.display_width, frame_h / self.display_height
@@ -726,74 +803,7 @@ class StuntCVApp:
             messagebox.showerror("Visualization Error", f"An error occurred while creating the visualization: {e}")
 
     def _find_poses_auto_for_save(self, frame, last_base, last_flyer):
-        # This is a non-state-updating version of find_poses_auto for file saving
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, _ = frame_rgb.shape
-        all_results = self.pose.process(frame_rgb).pose_landmarks
-
-        detected_poses = []
-        if all_results:
-            detected_poses.append(all_results)
-            frame_rgb_copy = np.copy(frame_rgb)
-            box1 = self.get_bounding_box(all_results.landmark, w, h)
-            cv2.rectangle(frame_rgb_copy, (int(box1[0])-10, int(box1[1])-10), (int(box1[2])+10, int(box1[3])+10), (0,0,0), -1)
-            second_results = self.pose.process(frame_rgb_copy).pose_landmarks
-            if second_results:
-                box2 = self.get_bounding_box(second_results.landmark, w, h)
-                if self.calculate_iou(box1, box2) < 0.1:
-                    detected_poses.append(second_results)
-
-        current_base, current_flyer = None, None
-
-        if last_base or last_flyer:
-            matched_indices = set()
-            if last_base:
-                last_box = self.get_bounding_box(last_base.landmark, w, h)
-                best_match_idx, best_iou = -1, 0
-                for i, pose in enumerate(detected_poses):
-                    current_box = self.get_bounding_box(pose.landmark, w, h)
-                    iou = self.calculate_iou(last_box, current_box)
-                    if i not in matched_indices and iou > best_iou:
-                        best_iou = iou
-                        best_match_idx = i
-                if best_match_idx != -1 and best_iou > 0.1:
-                    current_base = detected_poses[best_match_idx]
-                    matched_indices.add(best_match_idx)
-
-            if last_flyer:
-                last_box = self.get_bounding_box(last_flyer.landmark, w, h)
-                best_match_idx, best_iou = -1, 0
-                for i, pose in enumerate(detected_poses):
-                    if i in matched_indices: continue
-                    current_box = self.get_bounding_box(pose.landmark, w, h)
-                    iou = self.calculate_iou(last_box, current_box)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_match_idx = i
-                if best_match_idx != -1 and best_iou > 0.1:
-                    current_flyer = detected_poses[best_match_idx]
-                    matched_indices.add(best_match_idx)
-            
-            for i, pose in enumerate(detected_poses):
-                if i not in matched_indices:
-                    if not current_base: current_base = pose
-                    elif not current_flyer: current_flyer = pose
-        else:
-            if len(detected_poses) == 1:
-                current_base = detected_poses[0]
-            elif len(detected_poses) == 2:
-                avg_y1 = sum(lm.y for lm in detected_poses[0].landmark)
-                avg_y2 = sum(lm.y for lm in detected_poses[1].landmark)
-                if avg_y1 > avg_y2:
-                    current_base, current_flyer = detected_poses[0], detected_poses[1]
-                else:
-                    current_base, current_flyer = detected_poses[1], detected_poses[0]
-
-        base_results_obj = SmoothedResults(current_base) if current_base else None
-        flyer_results_obj = SmoothedResults(current_flyer) if current_flyer else None
-        
-        # Return the new state to be used in the next iteration of the save loop
-        return base_results_obj, flyer_results_obj, current_base, current_flyer
+        return self._detect_poses_auto(frame, last_base, last_flyer)
 
 if __name__ == "__main__":
     root = tk.Tk()
