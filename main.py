@@ -62,6 +62,8 @@ class StuntCVApp:
         self.current_frame_data = None
         self._resize_job = None
         self._last_detected_poses = []  # all people detected last frame, for click-to-assign
+        self._raw_base_pose  = None    # unsmoothed LandmarkList for the current base (identity anchor)
+        self._raw_flyer_pose = None    # unsmoothed LandmarkList for the current flyer
 
         # YOLOv8 Pose model — downloads yolov8n-pose.pt automatically on first run
         self.yolo = YOLO('yolov8n-pose.pt')
@@ -281,8 +283,9 @@ class StuntCVApp:
         if self.show_stats.get():
             self.update_stats_panel(smoothed_base, smoothed_flyer, time_delta)
 
-        self.draw_classified_poses(overlay_frame, smoothed_base, smoothed_flyer)
-        self.draw_classified_poses(pose_only_frame, smoothed_base, smoothed_flyer)
+        all_poses = [] if self.roi_tracking_enabled.get() else self._last_detected_poses
+        self.draw_classified_poses(overlay_frame, smoothed_base, smoothed_flyer, all_poses)
+        self.draw_classified_poses(pose_only_frame, smoothed_base, smoothed_flyer, all_poses)
 
         self.display_all_frames(original_frame, overlay_frame, pose_only_frame)
         if self.cap: self.slider.set(int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)))
@@ -342,11 +345,37 @@ class StuntCVApp:
         ])
 
     def _pose_avg_y(self, pose):
-        """Mean y of visible landmarks. Lower value = higher in frame = more likely the flyer."""
+        """Mean y of visible landmarks. Lower = higher in frame = more likely the flyer."""
         visible = [lm for lm in pose.landmark if lm.visibility > 0.3]
         if not visible:
             return 0.5
         return sum(lm.y for lm in visible) / len(visible)
+
+    def _pose_avg_x(self, pose):
+        visible = [lm for lm in pose.landmark if lm.visibility > 0.3]
+        if not visible:
+            return 0.5
+        return sum(lm.x for lm in visible) / len(visible)
+
+    def _best_stack_pair(self, poses):
+        """Find the (flyer, base) pair that best resembles a cheer stack:
+        large vertical separation, tight horizontal alignment.
+        Returns (flyer, base) or (None, None) if no valid stack exists."""
+        best_score, best_flyer, best_base = -1, None, None
+        for i, pa in enumerate(poses):
+            ya, xa = self._pose_avg_y(pa), self._pose_avg_x(pa)
+            for j, pb in enumerate(poses):
+                if i == j:
+                    continue
+                yb, xb = self._pose_avg_y(pb), self._pose_avg_x(pb)
+                vert  = yb - ya           # positive means pa is above pb
+                horiz = abs(xa - xb)
+                if vert <= 0:
+                    continue              # pa must be above pb to be the flyer
+                score = vert - 0.5 * horiz
+                if score > best_score:
+                    best_score, best_flyer, best_base = score, pa, pb
+        return best_flyer, best_base
 
     def _best_match(self, ref_lm, candidates, exclude, w, h):
         """Returns index of best matching pose using IoU with centroid-distance fallback."""
@@ -420,14 +449,20 @@ class StuntCVApp:
                 if not current_base and by_height:
                     current_base = by_height[-1]    # lowest remaining → base
         else:
-            # First frame: assign by vertical extremes so spotters in the middle are ignored.
-            # Use mean y (not raw sum) so landmark count doesn't bias the sort.
+            # First frame: use stack score to find the best stunt pair.
+            # Falls back to vertical extremes when no clear stack exists yet.
             if len(detected_poses) == 1:
                 current_base = detected_poses[0]
             elif len(detected_poses) >= 2:
-                by_y = sorted(detected_poses, key=self._pose_avg_y)
-                current_flyer = by_y[0]   # smallest mean y = highest in frame
-                current_base  = by_y[-1]  # largest mean y  = lowest in frame
+                current_flyer, current_base = self._best_stack_pair(detected_poses)
+                if current_flyer is None:
+                    by_y = sorted(detected_poses, key=self._pose_avg_y)
+                    current_flyer = by_y[0]
+                    current_base  = by_y[-1]
+
+        # Store raw (unsmoothed) pair identity so draw_classified_poses can identify spotters
+        self._raw_base_pose  = current_base
+        self._raw_flyer_pose = current_flyer
 
         # Preserve last known position on tracking loss so next frame can re-acquire
         new_base_lm  = current_base  if current_base  else last_base_lm
@@ -443,8 +478,23 @@ class StuntCVApp:
         )
         return base_results, flyer_results
 
-    def draw_classified_poses(self, frame, base_results, flyer_results):
+    def draw_classified_poses(self, frame, base_results, flyer_results, all_poses=None):
         fh, fw = frame.shape[:2]
+
+        # Draw all non-pair people as thin grey lines first (renders under the colored pair)
+        if all_poses:
+            for pose in all_poses:
+                if pose is self._raw_base_pose or pose is self._raw_flyer_pose:
+                    continue
+                lm = pose.landmark
+                for a, b in YOLO_CONNECTIONS:
+                    if (a < len(lm) and b < len(lm)
+                            and lm[a].visibility > 0.5 and lm[b].visibility > 0.5):
+                        p1 = (int(lm[a].x * fw), int(lm[a].y * fh))
+                        p2 = (int(lm[b].x * fw), int(lm[b].y * fh))
+                        cv2.line(frame, p1, p2, (90, 90, 90), 1, cv2.LINE_AA)
+
+        # Draw base (red) and flyer (blue) in full color on top
         for results, color, enabled in [
             (base_results,  (0, 0, 255), self.track_base.get()),
             (flyer_results, (255, 0, 0), self.track_flyer.get()),
@@ -759,7 +809,8 @@ class StuntCVApp:
             else:
                 base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
             smoothed_base, smoothed_flyer = self.smooth_pose(base_results, save_base_hist), self.smooth_pose(flyer_results, save_flyer_hist)
-            self.draw_classified_poses(output_frame, smoothed_base, smoothed_flyer)
+            save_all_poses = [] if roi_enabled else self._last_detected_poses
+            self.draw_classified_poses(output_frame, smoothed_base, smoothed_flyer, save_all_poses)
             out.write(output_frame)
             progress_label.config(text=f"Processing frame {i+1}/{num_frames}"); self.root.update_idletasks()
         cap.release(); out.release(); progress_dialog.destroy()
