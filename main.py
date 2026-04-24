@@ -341,6 +341,13 @@ class StuntCVApp:
             for i in range(len(kp_xyn))
         ])
 
+    def _pose_avg_y(self, pose):
+        """Mean y of visible landmarks. Lower value = higher in frame = more likely the flyer."""
+        visible = [lm for lm in pose.landmark if lm.visibility > 0.3]
+        if not visible:
+            return 0.5
+        return sum(lm.y for lm in visible) / len(visible)
+
     def _best_match(self, ref_lm, candidates, exclude, w, h):
         """Returns index of best matching pose using IoU with centroid-distance fallback."""
         ref_box = self.get_bounding_box(ref_lm.landmark, w, h)
@@ -402,18 +409,25 @@ class StuntCVApp:
                     current_flyer = detected_poses[idx]
                     matched_indices.add(idx)
 
-            for i, pose in enumerate(detected_poses):
-                if i not in matched_indices:
-                    if not current_base: current_base = pose
-                    elif not current_flyer: current_flyer = pose
+            # Assign any unmatched poses using height bias rather than arrival order:
+            # the highest person in frame goes to the flyer role, lowest to base.
+            unmatched = [detected_poses[i] for i in range(len(detected_poses)) if i not in matched_indices]
+            if unmatched:
+                by_height = sorted(unmatched, key=self._pose_avg_y)
+                if not current_flyer:
+                    current_flyer = by_height[0]    # highest in frame → flyer
+                    by_height = by_height[1:]
+                if not current_base and by_height:
+                    current_base = by_height[-1]    # lowest remaining → base
         else:
-            # First frame: pick vertical extremes so spotters in the middle are ignored
+            # First frame: assign by vertical extremes so spotters in the middle are ignored.
+            # Use mean y (not raw sum) so landmark count doesn't bias the sort.
             if len(detected_poses) == 1:
                 current_base = detected_poses[0]
             elif len(detected_poses) >= 2:
-                by_y = sorted(detected_poses, key=lambda p: sum(lm.y for lm in p.landmark))
-                current_flyer = by_y[0]   # smallest avg y = highest in frame
-                current_base  = by_y[-1]  # largest avg y = lowest in frame
+                by_y = sorted(detected_poses, key=self._pose_avg_y)
+                current_flyer = by_y[0]   # smallest mean y = highest in frame
+                current_base  = by_y[-1]  # largest mean y  = lowest in frame
 
         # Preserve last known position on tracking loss so next frame can re-acquire
         new_base_lm  = current_base  if current_base  else last_base_lm
