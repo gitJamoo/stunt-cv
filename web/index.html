@@ -190,7 +190,7 @@ $('analyze-btn').onclick = async () => {
   const video = $('video-select').value;
   if (!video) return;
   $('analyze-btn').disabled = true;
-  $('cancel-btn').style.display = '';
+  $('cancel-btn').style.display = 'inline-block';
   $('status').textContent = 'starting...';
   $('progress-wrap').style.display = 'flex';
   try {
@@ -236,7 +236,7 @@ function render(result) {
   frameCache.clear();
   frameIdx = 0;
 
-  $('results-section').style.display = '';
+  $('results-section').style.display = 'block';
   $('insights').style.display = 'block';
   $('insights').textContent = result.insights;
   addMsg('sys', 'System', `Analysis of "${result.video}" loaded — ask away.`);
@@ -255,7 +255,7 @@ function render(result) {
     $(id).on('plotly_click', ev => seekTo(Math.round(ev.points[0].x * analysis.fps)));
   }
 
-  $('player-section').style.display = '';
+  $('player-section').style.display = 'block';
   $('seek').max = result.frames - 1;
   showFrame(0);
 }
