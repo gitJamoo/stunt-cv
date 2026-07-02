@@ -48,6 +48,48 @@ class SmoothedResults:
         self.pose_landmarks = landmarks
 
 
+class PoseSmoother:
+    """Boxcar-averages landmarks over a rolling window, and holds the last
+    smoothed pose through short detection gaps (up to max_gap frames) so a
+    one-frame dropout doesn't wipe the history and snap on re-acquire."""
+    def __init__(self, window, max_gap=5):
+        self.frames = deque(maxlen=window)
+        self.max_gap = max_gap
+        self.miss = 0
+
+    def set_window(self, window):
+        if window != self.frames.maxlen:
+            self.frames = deque(self.frames, maxlen=window)
+
+    def clear(self):
+        self.frames.clear()
+        self.miss = 0
+
+    def smooth(self, results):
+        if not results or not results.pose_landmarks:
+            self.miss += 1
+            if self.miss > self.max_gap:
+                self.frames.clear()
+            return self._average()
+        self.miss = 0
+        self.frames.append(results.pose_landmarks.landmark)
+        return self._average()
+
+    def _average(self):
+        if not self.frames:
+            return None
+        n = len(self.frames[0])
+        smoothed = [
+            Landmark(
+                x=sum(f[i].x for f in self.frames) / len(self.frames),
+                y=sum(f[i].y for f in self.frames) / len(self.frames),
+                visibility=sum(f[i].visibility for f in self.frames) / len(self.frames),
+            )
+            for i in range(n)
+        ]
+        return SmoothedResults(LandmarkList(smoothed))
+
+
 class StuntCVApp:
     def __init__(self, root):
         self.root = root
@@ -62,18 +104,31 @@ class StuntCVApp:
         self.current_frame_data = None
         self._resize_job = None
         self._last_detected_poses = []  # all people detected last frame, for click-to-assign
-        self._raw_base_pose  = None    # unsmoothed LandmarkList for the current base (identity anchor)
+        self._last_detected_ids = []    # parallel list of ByteTrack IDs
+        self._raw_base_pose  = None    # unsmoothed LandmarkList for the current base
         self._raw_flyer_pose = None    # unsmoothed LandmarkList for the current flyer
 
-        # YOLOv8 Pose model — downloads yolov8n-pose.pt automatically on first run
-        self.yolo = YOLO('yolov8n-pose.pt')
+        # YOLOv8 Pose model — downloads yolov8m-pose.pt automatically on first run.
+        # Auto mode runs it through .track() (ByteTrack persistent IDs). ROI mode
+        # uses a separate plain-detection instance (created lazily), because
+        # .track() registers tracker callbacks on the model's predictor and
+        # per-crop detections must not feed the tracker.
+        self.yolo = YOLO('yolov8m-pose.pt')
+        self.yolo_roi = None
 
         # UI-Controlled Tracking Parameters
-        self.smoothing_window_var = tk.IntVar(value=10)
+        self.smoothing_window_var = tk.IntVar(value=8)
+        self.conf_threshold_var   = tk.DoubleVar(value=0.4)
+        self.keypoint_vis_var     = tk.DoubleVar(value=0.4)
 
-        # Smoothing Deques
-        self.base_history = deque(maxlen=self.smoothing_window_var.get())
-        self.flyer_history = deque(maxlen=self.smoothing_window_var.get())
+        # Crop State
+        self.detection_crop_enabled = tk.BooleanVar(value=False)
+        self.output_crop_enabled    = tk.BooleanVar(value=False)
+        self.detection_crop = {"x": 0, "y": 0, "w": self.display_width, "h": self.display_height, "name": "crop"}
+
+        # Smoothing
+        self.base_smoother = PoseSmoother(self.smoothing_window_var.get())
+        self.flyer_smoother = PoseSmoother(self.smoothing_window_var.get())
 
         # UI State Variables
         self.roi_tracking_enabled = tk.BooleanVar(value=False)
@@ -88,9 +143,11 @@ class StuntCVApp:
         self.drag_info = {}
         self.handle_size = 8
 
-        # Tracking State
-        self.last_base_results = None
-        self.last_flyer_results = None
+        # Tracking State: base/flyer roles are bound to ByteTrack IDs and stay
+        # sticky until a track dies or the user reassigns them
+        self.track_state = self._new_track_state()
+        self._inversion_count = 0
+        self.role_hint_var = tk.StringVar(value="")
 
         # Stats State
         self.last_com_base = None
@@ -170,12 +227,32 @@ class StuntCVApp:
         self.chk_stats = tk.Checkbutton(self.controls_frame, text="Show Stats", var=self.show_stats, command=self.on_visibility_toggle)
         self.chk_stats.pack(side=tk.LEFT, padx=10)
 
-        self.adv_controls_frame = tk.LabelFrame(self.root, text="Tracking Controls", padx=10, pady=10)
+        # Passive role-inversion warning — roles are never auto-swapped
+        self.role_hint_label = tk.Label(self.root, textvariable=self.role_hint_var, fg="#cc6600", font=("Arial", 10, "bold"))
+        self.role_hint_label.pack()
+
+        self.adv_controls_frame = tk.LabelFrame(self.root, text="Tracking Controls", padx=10, pady=5)
         self.adv_controls_frame.pack(padx=10, pady=5, fill=tk.X)
 
-        tk.Label(self.adv_controls_frame, text="Smoothing:").pack(side=tk.LEFT, padx=(0, 5))
-        self.smoothing_slider = tk.Scale(self.adv_controls_frame, from_=1, to=30, orient=tk.HORIZONTAL, variable=self.smoothing_window_var, command=self.on_smoothing_update)
+        row1 = tk.Frame(self.adv_controls_frame)
+        row1.pack(fill=tk.X)
+        tk.Label(row1, text="Smoothing:").pack(side=tk.LEFT, padx=(0, 5))
+        self.smoothing_slider = tk.Scale(row1, from_=1, to=30, orient=tk.HORIZONTAL, variable=self.smoothing_window_var, command=self.on_smoothing_update)
         self.smoothing_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(row1, text="Confidence:").pack(side=tk.LEFT, padx=(15, 5))
+        tk.Scale(row1, from_=0.05, to=0.95, resolution=0.05, orient=tk.HORIZONTAL, variable=self.conf_threshold_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        row2 = tk.Frame(self.adv_controls_frame)
+        row2.pack(fill=tk.X)
+        tk.Label(row2, text="Keypoint Vis:").pack(side=tk.LEFT, padx=(0, 5))
+        tk.Scale(row2, from_=0.05, to=0.95, resolution=0.05, orient=tk.HORIZONTAL, variable=self.keypoint_vis_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.crop_frame = tk.LabelFrame(self.root, text="Crop Controls", padx=10, pady=5)
+        self.crop_frame.pack(padx=10, pady=5, fill=tk.X)
+        tk.Checkbutton(self.crop_frame, text="Crop Detection Area", variable=self.detection_crop_enabled, command=self.on_crop_toggle).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(self.crop_frame, text="Crop Output Video",   variable=self.output_crop_enabled,    command=self.on_crop_toggle).pack(side=tk.LEFT, padx=5)
+        tk.Button(self.crop_frame, text="Reset Crop", command=self.reset_crop).pack(side=tk.LEFT, padx=10)
+        tk.Label(self.crop_frame, text="← drag yellow box on video to reposition", fg="gray").pack(side=tk.LEFT, padx=5)
 
     def on_window_resize(self, event):
         if event.widget is not self.root or not self.video_path:
@@ -229,8 +306,11 @@ class StuntCVApp:
         if not self.video_path: return
 
         self.playing = False
-        self.base_history.clear(); self.flyer_history.clear()
-        self.last_base_results, self.last_flyer_results = None, None
+        self.base_smoother.clear(); self.flyer_smoother.clear()
+        self.track_state = self._new_track_state()
+        self._inversion_count = 0
+        self.role_hint_var.set("")
+        self._reset_tracker()
         self.cap = cv2.VideoCapture(self.video_path)
         self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -240,6 +320,7 @@ class StuntCVApp:
         self.display_width = int(self.video_width * (self.display_height / self.video_height))
         for canvas in [self.canvas_left, self.canvas_middle, self.canvas_right]:
             canvas.config(width=self.display_width, height=self.display_height)
+        self.detection_crop = {"x": 0, "y": 0, "w": self.display_width, "h": self.display_height, "name": "crop"}
 
         self.playing = True
         self.video_loop()
@@ -277,8 +358,8 @@ class StuntCVApp:
         else:
             base_results, flyer_results = self.find_poses_auto(frame)
 
-        smoothed_base = self.smooth_pose(base_results, self.base_history)
-        smoothed_flyer = self.smooth_pose(flyer_results, self.flyer_history)
+        smoothed_base = self.base_smoother.smooth(base_results)
+        smoothed_flyer = self.flyer_smoother.smooth(flyer_results)
 
         if self.show_stats.get():
             self.update_stats_panel(smoothed_base, smoothed_flyer, time_delta)
@@ -299,18 +380,28 @@ class StuntCVApp:
             setattr(self, f"photo_{key}", photo)
             canvas.create_image(0, 0, image=photo, anchor=tk.NW)
 
-        if self.roi_tracking_enabled.get():
+        if self.roi_tracking_enabled.get() or self.detection_crop_enabled.get() or self.output_crop_enabled.get():
             self.draw_rois_on_canvas(self.canvas_middle)
 
     def draw_rois_on_canvas(self, canvas):
         canvas.delete("roi")
-        for roi, color in [(self.base_roi, "red"), (self.flyer_roi, "blue")]:
-            if (roi["name"] == "base" and self.track_base.get()) or (roi["name"] == "flyer" and self.track_flyer.get()):
-                x1, y1, x2, y2 = roi["x"], roi["y"], roi["x"] + roi["w"], roi["y"] + roi["h"]
-                canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, tags="roi")
-                s = self.handle_size // 2
-                for h_pos in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
-                    canvas.create_rectangle(h_pos[0]-s, h_pos[1]-s, h_pos[0]+s, h_pos[1]+s, fill=color, outline=color, tags="roi")
+        if self.roi_tracking_enabled.get():
+            for roi, color in [(self.base_roi, "red"), (self.flyer_roi, "blue")]:
+                if (roi["name"] == "base" and self.track_base.get()) or (roi["name"] == "flyer" and self.track_flyer.get()):
+                    x1, y1, x2, y2 = roi["x"], roi["y"], roi["x"] + roi["w"], roi["y"] + roi["h"]
+                    canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, tags="roi")
+                    s = self.handle_size // 2
+                    for h_pos in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+                        canvas.create_rectangle(h_pos[0]-s, h_pos[1]-s, h_pos[0]+s, h_pos[1]+s, fill=color, outline=color, tags="roi")
+        if self.detection_crop_enabled.get() or self.output_crop_enabled.get():
+            c = self.detection_crop
+            x1, y1, x2, y2 = c["x"], c["y"], c["x"] + c["w"], c["y"] + c["h"]
+            canvas.create_rectangle(x1, y1, x2, y2, outline="#FFD700", width=2, dash=(8, 4), tags="roi")
+            s = self.handle_size // 2
+            for pos in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+                canvas.create_rectangle(pos[0]-s, pos[1]-s, pos[0]+s, pos[1]+s, fill="#FFD700", outline="#FFD700", tags="roi")
+            label = "Detect+Output" if (self.detection_crop_enabled.get() and self.output_crop_enabled.get()) else ("Detect" if self.detection_crop_enabled.get() else "Output")
+            canvas.create_text(x1 + 4, y1 + 4, text=f"[{label}]", fill="#FFD700", anchor=tk.NW, tags="roi")
 
     def find_poses_by_roi(self, frame):
         base_results, flyer_results = None, None
@@ -327,10 +418,14 @@ class StuntCVApp:
         crop = frame[ry:ry2, rx:rx2]
         if crop.size == 0:
             return None
-        yolo_out = self.yolo(crop, verbose=False)[0]
+        if self.yolo_roi is None:
+            self.yolo_roi = YOLO('yolov8m-pose.pt')
+        yolo_out = self.yolo_roi(crop, verbose=False)[0]
         if yolo_out.keypoints is None or len(yolo_out.boxes) == 0:
             return None
         best_i = int(yolo_out.boxes.conf.argmax())
+        if float(yolo_out.boxes.conf[best_i]) < self.conf_threshold_var.get():
+            return None
         kp_xyn = yolo_out.keypoints.xyn[best_i].cpu().numpy()
         kp_conf = yolo_out.keypoints.conf[best_i].cpu().numpy()
         lm_list = self._yolo_to_landmarks(kp_xyn, kp_conf)
@@ -344,12 +439,17 @@ class StuntCVApp:
             for i in range(len(kp_xyn))
         ])
 
-    def _pose_avg_y(self, pose):
-        """Mean y of visible landmarks. Lower = higher in frame = more likely the flyer."""
-        visible = [lm for lm in pose.landmark if lm.visibility > 0.3]
-        if not visible:
-            return 0.5
-        return sum(lm.y for lm in visible) / len(visible)
+    def _pose_bottom_y(self, pose):
+        """Lowest visible point of a person (max y), preferring ankles/hips.
+        Robust to upper-body-only detections, where a mean over visible
+        keypoints makes an occluded base look like the highest person."""
+        lm = pose.landmark
+        lower = [lm[i].y for i in (KP_L_ANKLE, KP_R_ANKLE, KP_L_HIP, KP_R_HIP)
+                 if i < len(lm) and lm[i].visibility > 0.3]
+        if lower:
+            return max(lower)
+        visible = [p.y for p in lm if p.visibility > 0.3]
+        return max(visible) if visible else 0.5
 
     def _pose_avg_x(self, pose):
         visible = [lm for lm in pose.landmark if lm.visibility > 0.3]
@@ -357,129 +457,159 @@ class StuntCVApp:
             return 0.5
         return sum(lm.x for lm in visible) / len(visible)
 
-    def _best_stack_pair(self, poses):
-        """Find the (flyer, base) pair that best resembles a cheer stack:
-        large vertical separation, tight horizontal alignment.
-        Returns (flyer, base) or (None, None) if no valid stack exists."""
-        best_score, best_flyer, best_base = -1, None, None
-        for i, pa in enumerate(poses):
-            ya, xa = self._pose_avg_y(pa), self._pose_avg_x(pa)
-            for j, pb in enumerate(poses):
-                if i == j:
-                    continue
-                yb, xb = self._pose_avg_y(pb), self._pose_avg_x(pb)
-                vert  = yb - ya           # positive means pa is above pb
-                horiz = abs(xa - xb)
-                if vert <= 0:
-                    continue              # pa must be above pb to be the flyer
-                score = vert - 0.5 * horiz
-                if score > best_score:
-                    best_score, best_flyer, best_base = score, pa, pb
-        return best_flyer, best_base
+    def _best_stack_pair(self, ids, by_id):
+        """Pick (flyer_id, base_id): flyer = person whose lowest point is highest
+        in frame; base = person most horizontally aligned directly below them."""
+        ordered = sorted(ids, key=lambda t: self._pose_bottom_y(by_id[t]))
+        flyer_id = ordered[0]
+        flyer_x = self._pose_avg_x(by_id[flyer_id])
+        flyer_bottom = self._pose_bottom_y(by_id[flyer_id])
+        below = [t for t in ordered[1:] if self._pose_bottom_y(by_id[t]) > flyer_bottom]
+        if not below:
+            below = ordered[1:]
+        base_id = min(below, key=lambda t: abs(self._pose_avg_x(by_id[t]) - flyer_x))
+        return flyer_id, base_id
 
-    def _best_match(self, ref_lm, candidates, exclude, w, h):
-        """Returns index of best matching pose using IoU with centroid-distance fallback."""
-        ref_box = self.get_bounding_box(ref_lm.landmark, w, h)
-        ref_cx = (ref_box[0] + ref_box[2]) / 2
-        ref_cy = (ref_box[1] + ref_box[3]) / 2
-        ref_h = max(ref_box[3] - ref_box[1], 1)
+    def _new_track_state(self):
+        return {
+            'base_id': None, 'flyer_id': None,   # ByteTrack IDs bound to each role
+            'base_lm': None, 'flyer_lm': None,   # last known landmarks per role
+            'base_miss': 0, 'flyer_miss': 0,     # consecutive frames the role's track was absent
+            'initialized': False,                # roles picked (heuristic or user)
+        }
 
-        best_iou_idx, best_iou = -1, 0.0
-        best_cent_idx, best_cent_dist = -1, float('inf')
+    def _reset_tracker(self):
+        """Clear ByteTrack state so a new video / export pass starts fresh."""
+        predictor = getattr(self.yolo, 'predictor', None)
+        for tracker in getattr(predictor, 'trackers', None) or []:
+            if hasattr(tracker, 'reset'):
+                tracker.reset()
 
-        for i, pose in enumerate(candidates):
-            if i in exclude:
+    def _invalidate_role_ids(self):
+        """Track IDs restart after a tracker reset: drop the stale bindings and
+        let the overlap re-bind recover each role from its last known box."""
+        s = self.track_state
+        s['base_id'] = s['flyer_id'] = None
+        s['base_miss'] = s['flyer_miss'] = 5  # eligible for immediate re-bind
+
+    def _rebind_role(self, state, role, by_id, w, h):
+        """A role's track died and ByteTrack couldn't recover it: re-bind the
+        role to the unassigned track that best overlaps its last known box."""
+        last_lm = state[f'{role}_lm']
+        if last_lm is None:
+            return None
+        other_id = state['flyer_id'] if role == 'base' else state['base_id']
+        ref_box = self.get_bounding_box(last_lm.landmark, w, h)
+        best_id, best_iou = None, 0.25
+        for tid, pose in by_id.items():
+            if tid == other_id:
                 continue
-            box = self.get_bounding_box(pose.landmark, w, h)
-            iou = self.calculate_iou(ref_box, box)
+            iou = self.calculate_iou(ref_box, self.get_bounding_box(pose.landmark, w, h))
             if iou > best_iou:
-                best_iou, best_iou_idx = iou, i
-            dist = np.hypot((box[0] + box[2]) / 2 - ref_cx, (box[1] + box[3]) / 2 - ref_cy)
-            if dist < best_cent_dist:
-                best_cent_dist, best_cent_idx = dist, i
+                best_iou, best_id = iou, tid
+        return best_id
 
-        if best_iou >= 0.3:
-            return best_iou_idx
-        # Centroid fallback: handles fast toss/catch where boxes stop overlapping between frames
-        if best_cent_dist < ref_h * 1.5:
-            return best_cent_idx
-        return -1
-
-    def _detect_poses_auto(self, frame, last_base_lm, last_flyer_lm):
-        """Single-pass multi-person detection via YOLOv8.
-        Returns (base_obj, flyer_obj, raw_base_lm, raw_flyer_lm)."""
+    def _detect_poses_auto(self, frame, state):
+        """Single-pass multi-person detection with ByteTrack persistent IDs.
+        Roles are sticky: base/flyer are bound to track IDs once (heuristic on
+        the first frame with 2+ people, or by the user) and follow those IDs —
+        they are never silently reassigned by per-frame geometry.
+        Mutates `state`; returns (base_obj, flyer_obj)."""
         h, w = frame.shape[:2]
-        yolo_out = self.yolo(frame, verbose=False)[0]
 
-        detected_poses = []
-        if yolo_out.keypoints is not None:
+        detect_frame, dc_x, dc_y = frame, 0, 0
+        if self.detection_crop_enabled.get():
+            rx, ry, rw, rh = self.get_scaled_roi(self.detection_crop, w, h)
+            rx2, ry2 = min(rx + rw, w), min(ry + rh, h)
+            if rx2 > rx and ry2 > ry:
+                detect_frame = frame[ry:ry2, rx:rx2]
+                dc_x, dc_y = rx, ry
+
+        # conf=0.1 feeds low-confidence boxes to ByteTrack, whose second
+        # association stage uses them to hold tracks through occlusion —
+        # critical when the flyer covers the base. iou=0.7 keeps NMS from
+        # suppressing the stacked pair down to one detection. The UI
+        # confidence slider is applied below, but never to the boxes carrying
+        # the pair's track IDs.
+        yolo_out = self.yolo.track(detect_frame, persist=True, verbose=False, conf=0.1, iou=0.7)[0]
+
+        conf = self.conf_threshold_var.get()
+        role_ids = {state['base_id'], state['flyer_id']}
+        poses, ids = [], []
+        if yolo_out.keypoints is not None and yolo_out.boxes.id is not None:
             for i in range(len(yolo_out.boxes)):
-                if float(yolo_out.boxes.conf[i]) < 0.3:
+                tid = int(yolo_out.boxes.id[i])
+                if float(yolo_out.boxes.conf[i]) < conf and tid not in role_ids:
                     continue
                 kp_xyn = yolo_out.keypoints.xyn[i].cpu().numpy()
                 kp_conf = yolo_out.keypoints.conf[i].cpu().numpy()
-                detected_poses.append(self._yolo_to_landmarks(kp_xyn, kp_conf))
-        self._last_detected_poses = detected_poses
+                lm_list = self._yolo_to_landmarks(kp_xyn, kp_conf)
+                if dc_x or dc_y:
+                    dh, dw = detect_frame.shape[:2]
+                    self.translate_landmarks(lm_list, dc_x, dc_y, dw, dh, w, h)
+                poses.append(lm_list)
+                ids.append(tid)
+        self._last_detected_poses = poses
+        self._last_detected_ids = ids
+        by_id = dict(zip(ids, poses))
 
-        current_base, current_flyer = None, None
+        # One-shot role initialization
+        if not state['initialized']:
+            if len(poses) >= 2:
+                state['flyer_id'], state['base_id'] = self._best_stack_pair(ids, by_id)
+                state['initialized'] = True
+            elif len(poses) == 1:
+                state['base_id'] = ids[0]  # solo person: treat as base until a pair shows up
 
-        if last_base_lm or last_flyer_lm:
-            matched_indices = set()
+        for role in ('base', 'flyer'):
+            current = by_id.get(state[f'{role}_id'])
+            if current is None and (state[f'{role}_id'] is not None or state[f'{role}_lm'] is not None):
+                state[f'{role}_miss'] += 1
+                if state[f'{role}_miss'] >= 5:
+                    new_id = self._rebind_role(state, role, by_id, w, h)
+                    if new_id is not None:
+                        state[f'{role}_id'] = new_id
+                        current = by_id[new_id]
+            if current is not None:
+                state[f'{role}_miss'] = 0
+                state[f'{role}_lm'] = current
 
-            if last_base_lm:
-                idx = self._best_match(last_base_lm, detected_poses, matched_indices, w, h)
-                if idx != -1:
-                    current_base = detected_poses[idx]
-                    matched_indices.add(idx)
+        current_base = by_id.get(state['base_id'])
+        current_flyer = by_id.get(state['flyer_id'])
 
-            if last_flyer_lm:
-                idx = self._best_match(last_flyer_lm, detected_poses, matched_indices, w, h)
-                if idx != -1:
-                    current_flyer = detected_poses[idx]
-                    matched_indices.add(idx)
-
-            # Assign any unmatched poses using height bias rather than arrival order:
-            # the highest person in frame goes to the flyer role, lowest to base.
-            unmatched = [detected_poses[i] for i in range(len(detected_poses)) if i not in matched_indices]
-            if unmatched:
-                by_height = sorted(unmatched, key=self._pose_avg_y)
-                if not current_flyer:
-                    current_flyer = by_height[0]    # highest in frame → flyer
-                    by_height = by_height[1:]
-                if not current_base and by_height:
-                    current_base = by_height[-1]    # lowest remaining → base
-        else:
-            # First frame: use stack score to find the best stunt pair.
-            # Falls back to vertical extremes when no clear stack exists yet.
-            if len(detected_poses) == 1:
-                current_base = detected_poses[0]
-            elif len(detected_poses) >= 2:
-                current_flyer, current_base = self._best_stack_pair(detected_poses)
-                if current_flyer is None:
-                    by_y = sorted(detected_poses, key=self._pose_avg_y)
-                    current_flyer = by_y[0]
-                    current_base  = by_y[-1]
-
-        # Store raw (unsmoothed) pair identity so draw_classified_poses can identify spotters
+        # Raw pair identity so draw_classified_poses can single out spotters
         self._raw_base_pose  = current_base
         self._raw_flyer_pose = current_flyer
 
-        # Preserve last known position on tracking loss so next frame can re-acquire
-        new_base_lm  = current_base  if current_base  else last_base_lm
-        new_flyer_lm = current_flyer if current_flyer else last_flyer_lm
-
         base_obj  = SmoothedResults(current_base)  if current_base  else None
         flyer_obj = SmoothedResults(current_flyer) if current_flyer else None
-        return base_obj, flyer_obj, new_base_lm, new_flyer_lm
+        return base_obj, flyer_obj
 
     def find_poses_auto(self, frame):
-        base_results, flyer_results, self.last_base_results, self.last_flyer_results = self._detect_poses_auto(
-            frame, self.last_base_results, self.last_flyer_results
-        )
+        base_results, flyer_results = self._detect_poses_auto(frame, self.track_state)
+        self._update_role_hint(base_results, flyer_results)
         return base_results, flyer_results
+
+    def _update_role_hint(self, base_results, flyer_results):
+        """Passive warning when the flyer has sat below the base for a while —
+        roles are never auto-swapped, the user decides."""
+        if base_results and flyer_results:
+            flyer_bottom = self._pose_bottom_y(flyer_results.pose_landmarks)
+            base_bottom  = self._pose_bottom_y(base_results.pose_landmarks)
+            if flyer_bottom > base_bottom + 0.05:
+                self._inversion_count += 1
+            else:
+                self._inversion_count = 0
+        else:
+            self._inversion_count = 0
+        if self._inversion_count >= 15:
+            self.role_hint_var.set("⚠ Flyer is below base — roles may be swapped (use Swap Base/Flyer, or right-click a person)")
+        elif self._inversion_count == 0:
+            self.role_hint_var.set("")
 
     def draw_classified_poses(self, frame, base_results, flyer_results, all_poses=None):
         fh, fw = frame.shape[:2]
+        vis_thresh = self.keypoint_vis_var.get()
 
         # Draw all non-pair people as thin grey lines first (renders under the colored pair)
         if all_poses:
@@ -489,7 +619,7 @@ class StuntCVApp:
                 lm = pose.landmark
                 for a, b in YOLO_CONNECTIONS:
                     if (a < len(lm) and b < len(lm)
-                            and lm[a].visibility > 0.5 and lm[b].visibility > 0.5):
+                            and lm[a].visibility > vis_thresh and lm[b].visibility > vis_thresh):
                         p1 = (int(lm[a].x * fw), int(lm[a].y * fh))
                         p2 = (int(lm[b].x * fw), int(lm[b].y * fh))
                         cv2.line(frame, p1, p2, (90, 90, 90), 1, cv2.LINE_AA)
@@ -504,7 +634,7 @@ class StuntCVApp:
             lm = results.pose_landmarks.landmark
             for a, b in YOLO_CONNECTIONS:
                 if (a < len(lm) and b < len(lm)
-                        and lm[a].visibility > 0.5 and lm[b].visibility > 0.5):
+                        and lm[a].visibility > vis_thresh and lm[b].visibility > vis_thresh):
                     p1 = (int(lm[a].x * fw), int(lm[a].y * fh))
                     p2 = (int(lm[b].x * fw), int(lm[b].y * fh))
                     cv2.line(frame, p1, p2, color, 3, cv2.LINE_AA)
@@ -535,23 +665,36 @@ class StuntCVApp:
             menu.grab_release()
 
     def _assign_role(self, pose_idx, role):
-        if pose_idx >= len(self._last_detected_poses):
+        if pose_idx >= len(self._last_detected_ids):
             return
-        pose = self._last_detected_poses[pose_idx]
-        if role == 'base':
-            self.last_base_results = pose
-        else:
-            self.last_flyer_results = pose
-        # Clear smoothing history so the new assignment doesn't blend with the old person
-        self.base_history.clear()
-        self.flyer_history.clear()
+        tid = self._last_detected_ids[pose_idx]
+        state = self.track_state
+        other = 'flyer' if role == 'base' else 'base'
+        if state[f'{other}_id'] == tid:
+            # User reassigned the other role's person: give the displaced role
+            # this role's old track (net effect: a swap)
+            state[f'{other}_id'] = state[f'{role}_id']
+            state[f'{other}_lm'] = state[f'{role}_lm']
+        state[f'{role}_id'] = tid
+        state[f'{role}_lm'] = self._last_detected_poses[pose_idx]
+        state[f'{role}_miss'] = 0
+        state['initialized'] = True
+        self._inversion_count = 0
+        self.role_hint_var.set("")
+        self.base_smoother.clear()
+        self.flyer_smoother.clear()
         if not self.playing and self.current_frame_data is not None:
             self.process_and_display_frame()
 
     def swap_roles(self):
-        self.last_base_results, self.last_flyer_results = self.last_flyer_results, self.last_base_results
-        self.base_history.clear()
-        self.flyer_history.clear()
+        s = self.track_state
+        s['base_id'], s['flyer_id'] = s['flyer_id'], s['base_id']
+        s['base_lm'], s['flyer_lm'] = s['flyer_lm'], s['base_lm']
+        s['base_miss'], s['flyer_miss'] = s['flyer_miss'], s['base_miss']
+        self._inversion_count = 0
+        self.role_hint_var.set("")
+        self.base_smoother.clear()
+        self.flyer_smoother.clear()
         if self.current_frame_data is not None:
             self.process_and_display_frame()
 
@@ -573,6 +716,15 @@ class StuntCVApp:
         if self.current_frame_data is not None:
             self.process_and_display_frame()
 
+    def on_crop_toggle(self):
+        if self.current_frame_data is not None:
+            self.process_and_display_frame()
+
+    def reset_crop(self):
+        self.detection_crop.update({"x": 0, "y": 0, "w": self.display_width, "h": self.display_height})
+        if self.current_frame_data is not None:
+            self.process_and_display_frame()
+
     def on_visibility_toggle(self):
         if self.show_stats.get():
             self.stats_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y)
@@ -583,8 +735,14 @@ class StuntCVApp:
 
     def get_handle_at(self, x, y):
         s = self.handle_size // 2
-        for roi in [self.flyer_roi, self.base_roi]:
-            if (roi["name"] == "base" and not self.track_base.get()) or (roi["name"] == "flyer" and not self.track_flyer.get()): continue
+        rois = []
+        if self.roi_tracking_enabled.get():
+            for roi in [self.flyer_roi, self.base_roi]:
+                if (roi["name"] == "base" and not self.track_base.get()) or (roi["name"] == "flyer" and not self.track_flyer.get()): continue
+                rois.append(roi)
+        if self.detection_crop_enabled.get() or self.output_crop_enabled.get():
+            rois.append(self.detection_crop)
+        for roi in rois:
             x1, y1, x2, y2 = roi["x"], roi["y"], roi["x"] + roi["w"], roi["y"] + roi["h"]
             handles = {"tl": (x1, y1), "tr": (x2, y1), "bl": (x1, y2), "br": (x2, y2)}
             for name, pos in handles.items():
@@ -592,13 +750,18 @@ class StuntCVApp:
         return None, None
 
     def on_roi_press(self, event):
-        if not self.roi_tracking_enabled.get(): return
+        if not self.roi_tracking_enabled.get() and not self.detection_crop_enabled.get() and not self.output_crop_enabled.get(): return
         roi, handle = self.get_handle_at(event.x, event.y)
         if handle:
             self.active_roi = roi
             self.drag_info = {"type": "resize", "handle": handle, "orig_x": event.x, "orig_y": event.y, "roi_x": roi["x"], "roi_y": roi["y"], "roi_w": roi["w"], "roi_h": roi["h"]}
         else:
-            for r in [self.flyer_roi, self.base_roi]:
+            candidates = []
+            if self.roi_tracking_enabled.get():
+                candidates.extend([self.flyer_roi, self.base_roi])
+            if self.detection_crop_enabled.get() or self.output_crop_enabled.get():
+                candidates.append(self.detection_crop)
+            for r in candidates:
                 if r["x"] <= event.x <= r["x"] + r["w"] and r["y"] <= event.y <= r["y"] + r["h"]:
                     self.active_roi = r
                     self.drag_info = {"type": "move", "orig_x": event.x, "orig_y": event.y, "roi_x": r["x"], "roi_y": r["y"]}; break
@@ -622,10 +785,9 @@ class StuntCVApp:
         self.active_roi = None; self.drag_info = {}
 
     def on_smoothing_update(self, val):
-        new_window_size = int(val)
-        if not hasattr(self, 'base_history') or new_window_size != self.base_history.maxlen:
-            self.base_history = deque(maxlen=new_window_size)
-            self.flyer_history = deque(maxlen=new_window_size)
+        n = int(val)
+        self.base_smoother.set_window(n)
+        self.flyer_smoother.set_window(n)
 
     def update_stats_panel(self, base_results, flyer_results, time_delta):
         h, w = self.video_height, self.video_width
@@ -759,22 +921,6 @@ class StuntCVApp:
             lm.x = (lm.x * crop_w + crop_x) / frame_w
             lm.y = (lm.y * crop_h + crop_y) / frame_h
 
-    def smooth_pose(self, results, history):
-        if not results or not results.pose_landmarks:
-            history.clear()
-            return None
-        history.append(results.pose_landmarks.landmark)
-        n = len(history[0])
-        smoothed = [
-            Landmark(
-                x=sum(f[i].x for f in history) / len(history),
-                y=sum(f[i].y for f in history) / len(history),
-                visibility=sum(f[i].visibility for f in history) / len(history),
-            )
-            for i in range(n)
-        ]
-        return SmoothedResults(LandmarkList(smoothed))
-
     def save_video(self):
         if not self.video_path: messagebox.showwarning("No Video", "Please open a video file first."); return
         dialog = tk.Toplevel(self.root); dialog.title("Save Options"); dialog.geometry("300x100"); dialog.resizable(False, False)
@@ -792,9 +938,20 @@ class StuntCVApp:
         if not save_path: return
         cap = cv2.VideoCapture(self.video_path)
         width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
-        out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window_var.get()), deque(maxlen=self.smoothing_window_var.get())
-        last_base_results, last_flyer_results = None, None
+
+        out_w, out_h, crop_x, crop_y = width, height, 0, 0
+        if self.output_crop_enabled.get():
+            rx, ry, rw, rh = self.get_scaled_roi(self.detection_crop, width, height)
+            cx1 = max(0, min(rx, width));  cy1 = max(0, min(ry, height))
+            cx2 = max(0, min(rx + rw, width)); cy2 = max(0, min(ry + rh, height))
+            if cx2 > cx1 and cy2 > cy1:
+                out_w, out_h, crop_x, crop_y = cx2 - cx1, cy2 - cy1, cx1, cy1
+
+        out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_w, out_h))
+        save_base_sm  = PoseSmoother(self.smoothing_window_var.get())
+        save_flyer_sm = PoseSmoother(self.smoothing_window_var.get())
+        save_state = self._new_track_state()
+        self._reset_tracker()  # export re-runs the video from frame 0 with its own tracking state
         roi_enabled = self.roi_tracking_enabled.get()
         num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         progress_dialog = tk.Toplevel(self.root); progress_dialog.title("Saving...")
@@ -807,13 +964,19 @@ class StuntCVApp:
             if roi_enabled:
                 base_results, flyer_results = self.find_poses_by_roi(frame)
             else:
-                base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
-            smoothed_base, smoothed_flyer = self.smooth_pose(base_results, save_base_hist), self.smooth_pose(flyer_results, save_flyer_hist)
+                base_results, flyer_results = self._detect_poses_auto(frame, save_state)
+            smoothed_base, smoothed_flyer = save_base_sm.smooth(base_results), save_flyer_sm.smooth(flyer_results)
             save_all_poses = [] if roi_enabled else self._last_detected_poses
             self.draw_classified_poses(output_frame, smoothed_base, smoothed_flyer, save_all_poses)
+            if out_w < width or out_h < height:
+                output_frame = output_frame[crop_y:crop_y + out_h, crop_x:crop_x + out_w]
             out.write(output_frame)
             progress_label.config(text=f"Processing frame {i+1}/{num_frames}"); self.root.update_idletasks()
         cap.release(); out.release(); progress_dialog.destroy()
+        # The export polluted the shared tracker: reset it and let live playback
+        # re-bind its roles from their last known boxes
+        self._reset_tracker()
+        self._invalidate_role_ids()
         messagebox.showinfo("Save Complete", f"Video saved to {save_path}")
 
     def save_csv_data(self):
@@ -837,8 +1000,10 @@ class StuntCVApp:
         progress_dialog.geometry(f"+{self.root.winfo_x()+150}+{self.root.winfo_y()+150}")
         self.root.update_idletasks()
 
-        save_base_hist, save_flyer_hist = deque(maxlen=self.smoothing_window_var.get()), deque(maxlen=self.smoothing_window_var.get())
-        last_base_results, last_flyer_results = None, None
+        save_base_sm  = PoseSmoother(self.smoothing_window_var.get())
+        save_flyer_sm = PoseSmoother(self.smoothing_window_var.get())
+        save_state = self._new_track_state()
+        self._reset_tracker()  # export re-runs the video from frame 0 with its own tracking state
         roi_enabled = self.roi_tracking_enabled.get()
 
         with open(save_path, 'w', newline='') as f:
@@ -852,10 +1017,10 @@ class StuntCVApp:
                 if roi_enabled:
                     base_results, flyer_results = self.find_poses_by_roi(frame)
                 else:
-                    base_results, flyer_results, last_base_results, last_flyer_results = self._find_poses_auto_for_save(frame, last_base_results, last_flyer_results)
+                    base_results, flyer_results = self._detect_poses_auto(frame, save_state)
 
-                smoothed_base  = self.smooth_pose(base_results, save_base_hist)
-                smoothed_flyer = self.smooth_pose(flyer_results, save_flyer_hist)
+                smoothed_base  = save_base_sm.smooth(base_results)
+                smoothed_flyer = save_flyer_sm.smooth(flyer_results)
 
                 for person_id, results in [('base', smoothed_base), ('flyer', smoothed_flyer)]:
                     if results and results.pose_landmarks:
@@ -867,6 +1032,10 @@ class StuntCVApp:
 
         cap.release()
         progress_dialog.destroy()
+        # The export polluted the shared tracker: reset it and let live playback
+        # re-bind its roles from their last known boxes
+        self._reset_tracker()
+        self._invalidate_role_ids()
         messagebox.showinfo("Save Complete", f"CSV data saved to {save_path}")
         return save_path
 
@@ -938,10 +1107,6 @@ class StuntCVApp:
 
         except Exception as e:
             messagebox.showerror("Visualization Error", f"An error occurred while creating the visualization: {e}")
-
-    def _find_poses_auto_for_save(self, frame, last_base, last_flyer):
-        return self._detect_poses_auto(frame, last_base, last_flyer)
-
 
 if __name__ == "__main__":
     root = tk.Tk()

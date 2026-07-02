@@ -9,44 +9,61 @@ pip install -r requirements.txt
 python main.py
 ```
 
-There are no tests or linting configured. The only dependency file is `requirements.txt`.
+There are no tests or linting configured. The only dependency file is `requirements.txt`. The YOLOv8 pose model weights (`yolov8m-pose.pt`) download automatically on first run via ultralytics.
 
 ## Architecture
 
-The entire application lives in a single file: `main.py`. It is a Tkinter desktop GUI app with two classes:
+The entire application lives in a single file: `main.py`. It is a Tkinter desktop GUI app for analyzing cheer/acro stunts — it tracks two performers (a "base" and a "flyer") in video using YOLOv8-pose.
 
-- **`SmoothedResults`** — a thin wrapper that normalizes the return type from both tracking modes, so callers can treat them identically (`.pose_landmarks` attribute).
-- **`StuntCVApp`** — the main class. All UI layout, video playback, pose detection, smoothing, stats, and export logic lives here.
+Classes:
+
+- **`Landmark` / `LandmarkList` / `SmoothedResults`** — thin wrappers that mimic the old MediaPipe result shape (`.pose_landmarks.landmark[i].x/.y/.visibility`, normalized 0–1 coordinates). All YOLO output is converted into these via `_yolo_to_landmarks()`, so downstream code (smoothing, drawing, stats, export) is detector-agnostic.
+- **`PoseSmoother`** — boxcar-averages landmarks over a rolling window and holds the last smoothed pose through short detection gaps (`max_gap` frames) so brief occlusions don't snap the skeleton.
+- **`StuntCVApp`** — everything else: UI layout, video playback, detection, tracking, smoothing, stats, and export.
+
+### Pose Model
+
+YOLOv8-pose (ultralytics) with **COCO 17 keypoints** — not MediaPipe's 33. Keypoint indices are named constants at the top of `main.py` (`KP_L_SHOULDER = 5`, etc.); `YOLO_CONNECTIONS` defines the drawn skeleton. The model file is hardcoded in `__init__` (`yolov8m-pose.pt`; swap to `yolov8n-pose.pt` for speed). There are **two model instances**: `self.yolo` runs auto mode through `.track()` (ByteTrack), and `self.yolo_roi` (lazy) does plain detection for ROI mode — they must stay separate because `.track()` registers tracker callbacks on the model's predictor, and per-crop detections would corrupt tracker state.
 
 ### Core Data Flow (per frame)
 
 ```
 video_loop() → process_and_display_frame()
-    → find_poses_by_roi() OR find_poses_auto()   # detect raw poses
+    → find_poses_by_roi() OR find_poses_auto()   # detect + classify base/flyer
     → smooth_pose()                               # temporal averaging via deque
-    → draw_classified_poses()                     # render skeletons (base=red, flyer=blue)
     → update_stats_panel()                        # velocity, wobble, alignment, score
+    → draw_classified_poses()                     # base=red, flyer=blue, spotters=grey
     → display_all_frames()                        # render to 3 canvases
 ```
 
 ### Tracking Modes
 
-**Auto mode** (`find_poses_auto`): Runs MediaPipe Pose twice per frame — once on the full frame, then again on a copy with the first person blacked out. Uses IoU matching against the previous frame's bounding boxes to maintain base/flyer identity across frames. Falls back to vertical position (lower = base) on the first frame.
+**Auto mode** (`find_poses_auto` → `_detect_poses_auto`): One `yolo.track(persist=True)` pass per frame gives every person a persistent ByteTrack ID. **Roles are sticky to track IDs**: on the first frame with 2+ people, `_best_stack_pair` picks flyer (person whose lowest point is highest in frame) and base (most horizontally aligned below); after that, roles just follow their IDs and are never silently reassigned by geometry. The track call uses `conf=0.1` (ByteTrack's second association stage needs low-confidence boxes to hold tracks through occlusion) and `iou=0.7` (so NMS doesn't merge the stacked pair); the UI confidence slider filters everyone *except* the boxes carrying the pair's track IDs. If a role's track dies for ≥5 frames, `_rebind_role` re-binds it to the unassigned track that best overlaps its last known box. "Who's higher" comparisons use `_pose_bottom_y` (ankles/hips max-y), not mean keypoint y — an occluded base with only shoulders visible would otherwise look like the highest person. Role inversion (flyer below base for 15 frames) only sets a passive UI warning (`role_hint_var`); it never auto-swaps.
 
-**ROI mode** (`find_poses_by_roi`): Crops to two user-defined bounding boxes, runs MediaPipe on each crop independently, then translates landmarks back to full-frame coordinates via `translate_landmarks()`.
+`_detect_poses_auto` takes a `state` dict (`_new_track_state()`: role→track-ID bindings, last known landmarks, miss counters) and mutates it, so the live path (`self.track_state`) and the save/export loops each keep their own. It also writes `_last_detected_poses` / `_last_detected_ids` / `_raw_base_pose` / `_raw_flyer_pose` on `self` for drawing and click-to-assign. ByteTrack state lives *inside* `self.yolo`, so exports call `_reset_tracker()` before re-processing and `_reset_tracker()` + `_invalidate_role_ids()` after — live playback then recovers its roles via the overlap re-bind.
+
+**ROI mode** (`find_poses_by_roi`): Crops to two user-defined boxes, runs plain detection (`self.yolo_roi`) on each crop (best detection only), then translates landmarks back to full-frame coordinates via `translate_landmarks()`.
+
+**Manual role correction**: "Swap Base/Flyer" button, and right-click on a person in the middle canvas → context menu to bind their track ID to a role (assigning the other role's person swaps the pair). Both clear the smoothers.
+
+### Crop Controls
+
+A single draggable yellow box (`detection_crop`) serves two independent toggles: **Crop Detection Area** (YOLO only runs inside the box) and **Crop Output Video** (saved video is cropped to the box). ROI/crop boxes are stored in display-canvas coordinates and scaled to frame coordinates via `get_scaled_roi()` — relevant when touching the resize logic.
 
 ### Save Logic
 
-Saving video or CSV re-processes the entire video from scratch (not from cached frame data). `_find_poses_auto_for_save` is a near-duplicate of `find_poses_auto` that takes/returns explicit state instead of mutating `self`, so the save loop can maintain its own tracking state without corrupting live playback state.
+Saving video or CSV re-processes the entire video from scratch (not from cached frame data), with its own local `_new_track_state()` and `PoseSmoother`s, bracketed by tracker resets (see Auto mode above). Manual role corrections made during live playback are **not** carried into exports — the export re-runs the initialization heuristic. "Save CSV + Viz" additionally generates a Plotly HTML (CoM height, velocity, acceleration over time) next to the CSV.
 
 ### Stats Calculations
 
-- **Velocity**: Euclidean distance of center-of-mass between consecutive frames, divided by `time_delta`.
-- **Wobble**: Standard deviation of horizontal CoM positions over a 15-frame history window.
-- **CoM** (`calculate_center_of_mass`): Simple unweighted average of key landmark groups (shoulders/hips, legs, arms). Visibility threshold of 0.5.
-- **Stunt Score**: Weighted average of flyer height (40%), flyer horizontal stability (30%), and base/flyer horizontal alignment (30%). All in raw pixel space — not normalized to person size or camera distance.
-- **Alignment** (Base): Sum of horizontal deviations between shoulders, hips, and ankles.
-- **Plumb Line**: Absolute horizontal distance between base and flyer CoMs.
+All stats are normalized by **torso length** (`get_torso_length`, shoulder-to-hip pixel distance, unit "TL") to be camera-distance invariant.
+
+- **Velocity**: CoM displacement between frames / time_delta / torso length (TL/s).
+- **Wobble**: Mean std dev of CoM over a 15-frame history, / torso length.
+- **CoM** (`calculate_center_of_mass`): Unweighted average of torso/leg/arm keypoints with visibility > 0.5.
+- **Alignment** (base): Horizontal deviation across shoulder/hip/ankle stack.
+- **Plumb Line**: Horizontal offset between base and flyer CoMs.
+- **Stunt Score**: Weighted: flyer height 40%, flyer wobble 30%, plumb line 30%.
 
 ### Output Directories
 
