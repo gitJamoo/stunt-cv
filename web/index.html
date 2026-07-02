@@ -11,19 +11,27 @@
   header { padding: 14px 24px; background: #1c1f26; border-bottom: 1px solid #2a2e38; display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 18px; margin: 0; }
   header .accent { color: #4da3ff; }
-  main { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; padding: 16px 24px; max-width: 1400px; margin: 0 auto; }
-  section { background: #1c1f26; border: 1px solid #2a2e38; border-radius: 10px; padding: 16px; }
+  main { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; padding: 16px 24px; max-width: 1500px; margin: 0 auto; }
+  section { background: #1c1f26; border: 1px solid #2a2e38; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
   h2 { font-size: 14px; margin: 0 0 10px; color: #9aa4b2; text-transform: uppercase; letter-spacing: .06em; }
-  select, button, input { font: inherit; border-radius: 6px; border: 1px solid #3a4050; background: #262b35; color: #e8e8e8; padding: 8px 12px; }
+  select, button, input { font: inherit; border-radius: 6px; border: 1px solid #3a4050; background: #262b35; color: #e8e8e8; padding: 7px 12px; }
   button { cursor: pointer; background: #2563eb; border-color: #2563eb; }
+  button.secondary { background: #262b35; border-color: #3a4050; }
   button:disabled { opacity: .5; cursor: default; }
   #controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  #progress-wrap { display: none; margin-top: 12px; }
-  #progress-bar { height: 8px; background: #2a2e38; border-radius: 4px; overflow: hidden; }
+  #progress-wrap { display: none; margin-top: 12px; align-items: center; gap: 10px; }
+  #progress-bar { flex: 1; height: 8px; background: #2a2e38; border-radius: 4px; overflow: hidden; }
   #progress-fill { height: 100%; width: 0; background: #4da3ff; transition: width .2s; }
-  #insights { white-space: pre-wrap; background: #262b35; border-radius: 8px; padding: 12px; font-size: 14px; line-height: 1.5; display: none; margin-top: 12px; }
-  .chart { height: 260px; margin-top: 12px; }
-  #chat-log { height: 380px; overflow-y: auto; background: #262b35; border-radius: 8px; padding: 12px; font-size: 14px; }
+  #player-section { display: none; }
+  #player-canvas { width: 100%; border-radius: 8px; background: #000; display: block; }
+  #player-controls { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  #seek { flex: 1; min-width: 200px; accent-color: #4da3ff; padding: 0; border: 0; background: transparent; }
+  #time-label { font-variant-numeric: tabular-nums; color: #9aa4b2; font-size: 13px; min-width: 150px; }
+  .legend { font-size: 12px; color: #9aa4b2; margin-top: 6px; }
+  .legend .b { color: #ff4d4d; } .legend .f { color: #4da3ff; } .legend .s { color: #888; }
+  #insights { white-space: pre-wrap; background: #262b35; border-radius: 8px; padding: 12px; font-size: 14px; line-height: 1.5; display: none; }
+  .chart { height: 240px; margin-top: 12px; }
+  #chat-log { height: 420px; overflow-y: auto; background: #262b35; border-radius: 8px; padding: 12px; font-size: 14px; }
   .msg { margin-bottom: 10px; line-height: 1.45; white-space: pre-wrap; }
   .msg .who { font-weight: 600; }
   .msg.you .who { color: #4da3ff; }
@@ -31,9 +39,8 @@
   .msg.sys .who { color: #f59e0b; }
   #chat-form { display: flex; gap: 8px; margin-top: 10px; }
   #chat-input { flex: 1; }
-  .left-col { grid-column: 1; }
-  .right-col { grid-column: 2; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } .right-col { grid-column: 1; } }
+  .hint { font-size: 12px; color: #6b7280; margin-top: 8px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -42,35 +49,78 @@
   <span style="color:#9aa4b2;font-size:13px">pose-tracking stunt analysis — local web UI</span>
 </header>
 <main>
-  <section class="left-col">
-    <h2>Analyze</h2>
-    <div id="controls">
-      <select id="video-select"></select>
-      <button id="analyze-btn">Analyze</button>
-      <span id="status" style="color:#9aa4b2;font-size:13px"></span>
-    </div>
-    <div id="progress-wrap">
-      <div id="progress-bar"><div id="progress-fill"></div></div>
-    </div>
-    <div id="insights"></div>
-    <div id="chart-height" class="chart"></div>
-    <div id="chart-score" class="chart"></div>
-    <div id="chart-wobble" class="chart"></div>
-    <div id="chart-plumb" class="chart"></div>
-  </section>
+  <div>
+    <section>
+      <h2>Video</h2>
+      <div id="controls">
+        <select id="video-select"></select>
+        <button id="analyze-btn">Analyze</button>
+        <button id="cancel-btn" class="secondary" style="display:none">Cancel</button>
+        <label class="secondary" style="border:1px solid #3a4050;border-radius:6px;padding:7px 12px;cursor:pointer">
+          Upload… <input id="upload-input" type="file" accept=".mp4,.mov,.avi" style="display:none">
+        </label>
+        <span id="status" style="color:#9aa4b2;font-size:13px"></span>
+      </div>
+      <div id="progress-wrap">
+        <div id="progress-bar"><div id="progress-fill"></div></div>
+      </div>
+    </section>
 
-  <section class="right-col">
-    <h2>AI Coach</h2>
-    <div id="chat-log"><div class="msg sys"><span class="who">System:</span> Run an analysis, then ask questions about the stunt.</div></div>
-    <form id="chat-form">
-      <input id="chat-input" placeholder="Ask about the stunt..." autocomplete="off">
-      <button id="chat-send">Send</button>
-    </form>
-  </section>
+    <section id="player-section">
+      <h2>Playback</h2>
+      <canvas id="player-canvas"></canvas>
+      <div id="player-controls">
+        <button id="play-btn" class="secondary">▶</button>
+        <button id="step-back" class="secondary">⏮ 1</button>
+        <button id="step-fwd" class="secondary">1 ⏭</button>
+        <input id="seek" type="range" min="0" max="0" value="0">
+        <span id="time-label"></span>
+        <select id="speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+        </select>
+        <label style="font-size:13px;color:#9aa4b2"><input id="overlay-chk" type="checkbox" checked> overlay</label>
+      </div>
+      <div class="legend"><span class="b">■ base</span> &nbsp; <span class="f">■ flyer</span> &nbsp; <span class="s">■ spotters</span>
+        &nbsp;·&nbsp; space = play/pause, ←/→ = frame step, click a chart to jump there</div>
+    </section>
+
+    <section id="results-section" style="display:none">
+      <h2>Insights</h2>
+      <div id="insights"></div>
+      <div id="chart-height" class="chart"></div>
+      <div id="chart-score" class="chart"></div>
+      <div id="chart-wobble" class="chart"></div>
+      <div id="chart-plumb" class="chart"></div>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>AI Coach</h2>
+      <div id="chat-log"><div class="msg sys"><span class="who">System:</span> Run an analysis, then ask questions about the stunt.</div></div>
+      <form id="chat-form">
+        <input id="chat-input" placeholder="Ask about the stunt..." autocomplete="off">
+        <button id="chat-send">Send</button>
+      </form>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input id="api-key" type="password" placeholder="DeepSeek API key" style="flex:1" autocomplete="off">
+      </div>
+      <div class="hint">Key is kept in this browser (localStorage) and sent only to your local server. Answers are grounded in the last analysis.</div>
+    </section>
+  </div>
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
+
+// COCO-17 skeleton, must match pose_data.YOLO_CONNECTIONS
+const CONN = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],
+              [5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+const VIS = 0.4;
+const COLORS = { b: '#ff4d4d', f: '#4da3ff' };
+
 const layout = extra => Object.assign({
   paper_bgcolor: '#1c1f26', plot_bgcolor: '#1c1f26',
   font: { color: '#9aa4b2', size: 11 },
@@ -80,33 +130,89 @@ const layout = extra => Object.assign({
 }, extra);
 
 let chatHistory = [];
+let analysis = null;        // {video, fps, frames, poses, metrics, insights, ...}
+let frameIdx = 0;
+let playing = false;
+let loadSeq = 0;            // discards stale frame fetches while scrubbing
+const frameCache = new Map();
 
-async function loadVideos() {
-  const res = await fetch('/api/videos');
-  const { videos } = await res.json();
+// ---------------------------------------------------------------- videos
+
+async function loadVideos(selectName) {
+  const { videos } = await (await fetch('/api/videos')).json();
   $('video-select').innerHTML = videos.map(v => `<option>${v}</option>`).join('')
     || '<option disabled>no videos in raw_videos/</option>';
+  if (selectName) $('video-select').value = selectName;
+  tryLoadCached();
 }
+
+$('video-select').onchange = tryLoadCached;
+
+async function tryLoadCached() {
+  const video = $('video-select').value;
+  if (!video) return;
+  stopPlayback();
+  const res = await fetch(`/api/analysis/${encodeURIComponent(video)}`);
+  if (res.ok) {
+    render(await res.json());
+    $('status').textContent = 'loaded cached analysis';
+  } else {
+    analysis = null;
+    $('player-section').style.display = 'none';
+    $('results-section').style.display = 'none';
+    $('status').textContent = 'no analysis yet';
+  }
+}
+
+$('upload-input').onchange = async () => {
+  const file = $('upload-input').files[0];
+  if (!file) return;
+  $('upload-input').value = '';  // allow re-selecting the same file later
+  $('status').textContent = `uploading ${file.name}...`;
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).detail);
+    const { video } = await res.json();
+    $('status').textContent = `uploaded ${video}`;
+    await loadVideos(video);
+  } catch (e) {
+    $('status').textContent = 'upload failed: ' + e.message;
+  }
+};
+
+// ---------------------------------------------------------------- analysis
+
+let currentJob = null;
 
 $('analyze-btn').onclick = async () => {
   const video = $('video-select').value;
   if (!video) return;
   $('analyze-btn').disabled = true;
+  $('cancel-btn').style.display = '';
   $('status').textContent = 'starting...';
-  $('progress-wrap').style.display = 'block';
+  $('progress-wrap').style.display = 'flex';
   try {
     const res = await fetch('/api/analyze', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ video })
     });
     if (!res.ok) throw new Error((await res.json()).detail);
-    const { job_id } = await res.json();
-    await poll(job_id);
+    currentJob = (await res.json()).job_id;
+    await poll(currentJob);
   } catch (e) {
     $('status').textContent = 'error: ' + e.message;
   } finally {
     $('analyze-btn').disabled = false;
+    $('cancel-btn').style.display = 'none';
+    $('progress-wrap').style.display = 'none';
+    currentJob = null;
   }
+};
+
+$('cancel-btn').onclick = () => {
+  if (currentJob) fetch(`/api/jobs/${currentJob}/cancel`, { method: 'POST' });
 };
 
 async function poll(jobId) {
@@ -116,32 +222,155 @@ async function poll(jobId) {
       $('progress-fill').style.width = (100 * job.progress / job.total) + '%';
       $('status').textContent = `frame ${job.progress}/${job.total}`;
     }
-    if (job.status === 'done') { render(job.result); return; }
+    if (job.status === 'done') { render(job.result); $('status').textContent = 'analysis complete'; return; }
+    if (job.status === 'cancelled') { $('status').textContent = 'cancelled'; return; }
     if (job.status === 'error') { $('status').textContent = 'error: ' + job.error; return; }
     await new Promise(r => setTimeout(r, 700));
   }
 }
 
+// ---------------------------------------------------------------- results
+
 function render(result) {
-  $('status').textContent = 'done: ' + result.video;
-  $('progress-wrap').style.display = 'none';
+  analysis = result;
+  frameCache.clear();
+  frameIdx = 0;
+
+  $('results-section').style.display = '';
   $('insights').style.display = 'block';
   $('insights').textContent = result.insights;
-  addMsg('sys', 'System', 'Analysis of "' + result.video + '" loaded — ask away.');
+  addMsg('sys', 'System', `Analysis of "${result.video}" loaded — ask away.`);
 
   const m = result.metrics;
   const t = m.map(r => r.time);
   const line = (col, name) => ({ x: t, y: m.map(r => r[col]), name, mode: 'lines' });
+  const charts = [
+    ['chart-height', [line('flyer_height', 'flyer height')], 'Flyer Height'],
+    ['chart-score', [line('stunt_score', 'score')], 'Stunt Score'],
+    ['chart-wobble', [line('base_wobble', 'base'), line('flyer_wobble', 'flyer')], 'Wobble (TL)'],
+    ['chart-plumb', [line('plumb_signed', 'offset')], 'Plumb Offset (+ = flyer right of base)'],
+  ];
+  for (const [id, traces, title] of charts) {
+    Plotly.newPlot(id, traces, layout({ title }), { displayModeBar: false });
+    $(id).on('plotly_click', ev => seekTo(Math.round(ev.points[0].x * analysis.fps)));
+  }
 
-  Plotly.newPlot('chart-height', [line('flyer_height', 'flyer height')],
-    layout({ title: 'Flyer Height' }), { displayModeBar: false });
-  Plotly.newPlot('chart-score', [line('stunt_score', 'score')],
-    layout({ title: 'Stunt Score' }), { displayModeBar: false });
-  Plotly.newPlot('chart-wobble', [line('base_wobble', 'base'), line('flyer_wobble', 'flyer')],
-    layout({ title: 'Wobble (TL)' }), { displayModeBar: false });
-  Plotly.newPlot('chart-plumb', [line('plumb_signed', 'offset')],
-    layout({ title: 'Plumb Offset (+ = flyer right of base)' }), { displayModeBar: false });
+  $('player-section').style.display = '';
+  $('seek').max = result.frames - 1;
+  showFrame(0);
 }
+
+// ---------------------------------------------------------------- player
+
+function frameURL(i) {
+  return `/api/frame/${encodeURIComponent(analysis.video)}/${i}`;
+}
+
+function fetchFrame(i) {
+  if (frameCache.has(i)) return Promise.resolve(frameCache.get(i));
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      if (frameCache.size > 240) frameCache.delete(frameCache.keys().next().value);
+      frameCache.set(i, img);
+      resolve(img);
+    };
+    img.onerror = reject;
+    img.src = frameURL(i);
+  });
+}
+
+async function showFrame(i) {
+  if (!analysis) return;
+  frameIdx = Math.max(0, Math.min(i, analysis.frames - 1));
+  const seq = ++loadSeq;
+  let img;
+  try { img = await fetchFrame(frameIdx); } catch { return; }
+  if (seq !== loadSeq) return;  // a newer request superseded this one
+
+  const canvas = $('player-canvas');
+  if (canvas.width !== img.naturalWidth) {
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  if ($('overlay-chk').checked) drawOverlay(ctx, canvas.width, canvas.height);
+
+  $('seek').value = frameIdx;
+  const t = frameIdx / analysis.fps;
+  const total = analysis.frames / analysis.fps;
+  $('time-label').textContent =
+    `${t.toFixed(2)}s / ${total.toFixed(2)}s · frame ${frameIdx}/${analysis.frames - 1}`;
+
+  fetchFrame(Math.min(frameIdx + 1, analysis.frames - 1));  // prefetch
+}
+
+function drawOverlay(ctx, w, h) {
+  const pose = analysis.poses[frameIdx];
+  if (!pose) return;
+  for (const kp of pose.s) drawSkeleton(ctx, kp, w, h, '#8a8a8a', 1.5);
+  if (pose.b) drawSkeleton(ctx, pose.b, w, h, COLORS.b, 3.5);
+  if (pose.f) drawSkeleton(ctx, pose.f, w, h, COLORS.f, 3.5);
+}
+
+function drawSkeleton(ctx, kp, w, h, color, width) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (const [a, b] of CONN) {
+    if (kp[a] && kp[b] && kp[a][2] > VIS && kp[b][2] > VIS) {
+      ctx.moveTo(kp[a][0] * w, kp[a][1] * h);
+      ctx.lineTo(kp[b][0] * w, kp[b][1] * h);
+    }
+  }
+  ctx.stroke();
+}
+
+async function playLoop() {
+  while (playing && analysis) {
+    const started = performance.now();
+    if (frameIdx >= analysis.frames - 1) { stopPlayback(); return; }
+    await showFrame(frameIdx + 1);
+    const budget = 1000 / (analysis.fps * parseFloat($('speed').value));
+    const wait = budget - (performance.now() - started);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  }
+}
+
+function startPlayback() {
+  if (!analysis || playing) return;
+  if (frameIdx >= analysis.frames - 1) frameIdx = 0;
+  playing = true;
+  $('play-btn').textContent = '⏸';
+  playLoop();
+}
+
+function stopPlayback() {
+  playing = false;
+  $('play-btn').textContent = '▶';
+}
+
+function seekTo(i) {
+  stopPlayback();
+  showFrame(i);
+}
+
+$('play-btn').onclick = () => playing ? stopPlayback() : startPlayback();
+$('step-back').onclick = () => seekTo(frameIdx - 1);
+$('step-fwd').onclick = () => seekTo(frameIdx + 1);
+$('seek').oninput = e => seekTo(parseInt(e.target.value));
+$('overlay-chk').onchange = () => showFrame(frameIdx);
+
+document.addEventListener('keydown', e => {
+  if (!analysis || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); playing ? stopPlayback() : startPlayback(); }
+  else if (e.code === 'ArrowLeft') { e.preventDefault(); seekTo(frameIdx - 1); }
+  else if (e.code === 'ArrowRight') { e.preventDefault(); seekTo(frameIdx + 1); }
+});
+
+// ---------------------------------------------------------------- chat
 
 function addMsg(cls, who, text) {
   const div = document.createElement('div');
@@ -162,7 +391,7 @@ $('chat-form').onsubmit = async e => {
   try {
     const res = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, history: chatHistory })
+      body: JSON.stringify({ message: text, history: chatHistory, api_key: $('api-key').value.trim() })
     });
     if (!res.ok) throw new Error((await res.json()).detail);
     const { reply } = await res.json();
@@ -174,6 +403,13 @@ $('chat-form').onsubmit = async e => {
     $('chat-send').disabled = false;
   }
 };
+
+// Remember the API key in this browser; show when the server already has one
+$('api-key').value = localStorage.getItem('deepseek_key') || '';
+$('api-key').oninput = () => localStorage.setItem('deepseek_key', $('api-key').value.trim());
+fetch('/api/config').then(r => r.json()).then(c => {
+  if (c.server_has_key) $('api-key').placeholder = 'DeepSeek API key (optional — server has one)';
+});
 
 loadVideos();
 </script>

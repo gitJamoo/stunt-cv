@@ -6,13 +6,16 @@ Goal: move from the Tkinter desktop app to a polished local web UI.
 
 - [x] Extract headless modules (`tracking.py` / `stats.py` / `insights.py`) — prerequisite
 - [x] FastAPI skeleton: `server.py` + `web/index.html` POC (video list → analyze with progress → insights + charts → AI chat)
-- [ ] Show the video in the browser with pose overlays (stream annotated JPEG frames, or pre-render an annotated MP4 per analysis and serve it)
-- [ ] Playback controls on web: scrub, frame-step, slow motion
-- [ ] Role correction on web: click a person to set base/flyer (needs per-frame track IDs in the API)
-- [ ] Upload videos from the browser instead of dropping files into `raw_videos/`
-- [ ] Progress over WebSocket instead of polling; cancel button
-- [ ] Persist analyses (save metrics JSON per video, reload without re-processing)
+- [x] Show the video in the browser with pose overlays (frames served as JPEG, skeletons drawn client-side on canvas from per-frame poses)
+- [x] Playback controls on web: play/pause, scrub, frame-step (arrow keys), slow motion, overlay toggle, click-a-chart-to-seek
+- [x] Upload videos from the browser
+- [x] Cancel button for running analyses
+- [x] Persist analyses (`analyses/<video>.json`, auto-loaded on video select)
+- [x] Browser API key field (localStorage) with server env fallback
+- [ ] Role correction on web: click a person to set base/flyer (needs per-frame track IDs in the API + partial re-analysis from the corrected frame)
+- [ ] Progress over WebSocket instead of polling
 - [ ] Streamed chat responses (DeepSeek SSE)
+- [ ] Smoother playback: pre-encoded annotated MP4 as an alternative to per-frame JPEG fetches for long videos
 - [ ] Retire or simplify the Tkinter app once the web UI covers its features
 
 Until the web UI replaces it, worthwhile Tk fixes:
