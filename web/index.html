@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stunt CV</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: #14161a; color: #e8e8e8; }
+  header { padding: 14px 24px; background: #1c1f26; border-bottom: 1px solid #2a2e38; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .accent { color: #4da3ff; }
+  main { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; padding: 16px 24px; max-width: 1400px; margin: 0 auto; }
+  section { background: #1c1f26; border: 1px solid #2a2e38; border-radius: 10px; padding: 16px; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: #9aa4b2; text-transform: uppercase; letter-spacing: .06em; }
+  select, button, input { font: inherit; border-radius: 6px; border: 1px solid #3a4050; background: #262b35; color: #e8e8e8; padding: 8px 12px; }
+  button { cursor: pointer; background: #2563eb; border-color: #2563eb; }
+  button:disabled { opacity: .5; cursor: default; }
+  #controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #progress-wrap { display: none; margin-top: 12px; }
+  #progress-bar { height: 8px; background: #2a2e38; border-radius: 4px; overflow: hidden; }
+  #progress-fill { height: 100%; width: 0; background: #4da3ff; transition: width .2s; }
+  #insights { white-space: pre-wrap; background: #262b35; border-radius: 8px; padding: 12px; font-size: 14px; line-height: 1.5; display: none; margin-top: 12px; }
+  .chart { height: 260px; margin-top: 12px; }
+  #chat-log { height: 380px; overflow-y: auto; background: #262b35; border-radius: 8px; padding: 12px; font-size: 14px; }
+  .msg { margin-bottom: 10px; line-height: 1.45; white-space: pre-wrap; }
+  .msg .who { font-weight: 600; }
+  .msg.you .who { color: #4da3ff; }
+  .msg.ai .who { color: #34d399; }
+  .msg.sys .who { color: #f59e0b; }
+  #chat-form { display: flex; gap: 8px; margin-top: 10px; }
+  #chat-input { flex: 1; }
+  .left-col { grid-column: 1; }
+  .right-col { grid-column: 2; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } .right-col { grid-column: 1; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stunt <span class="accent">CV</span></h1>
+  <span style="color:#9aa4b2;font-size:13px">pose-tracking stunt analysis — local web UI</span>
+</header>
+<main>
+  <section class="left-col">
+    <h2>Analyze</h2>
+    <div id="controls">
+      <select id="video-select"></select>
+      <button id="analyze-btn">Analyze</button>
+      <span id="status" style="color:#9aa4b2;font-size:13px"></span>
+    </div>
+    <div id="progress-wrap">
+      <div id="progress-bar"><div id="progress-fill"></div></div>
+    </div>
+    <div id="insights"></div>
+    <div id="chart-height" class="chart"></div>
+    <div id="chart-score" class="chart"></div>
+    <div id="chart-wobble" class="chart"></div>
+    <div id="chart-plumb" class="chart"></div>
+  </section>
+
+  <section class="right-col">
+    <h2>AI Coach</h2>
+    <div id="chat-log"><div class="msg sys"><span class="who">System:</span> Run an analysis, then ask questions about the stunt.</div></div>
+    <form id="chat-form">
+      <input id="chat-input" placeholder="Ask about the stunt..." autocomplete="off">
+      <button id="chat-send">Send</button>
+    </form>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const layout = extra => Object.assign({
+  paper_bgcolor: '#1c1f26', plot_bgcolor: '#1c1f26',
+  font: { color: '#9aa4b2', size: 11 },
+  margin: { l: 45, r: 15, t: 35, b: 35 },
+  xaxis: { title: 'time (s)', gridcolor: '#2a2e38' },
+  yaxis: { gridcolor: '#2a2e38' },
+}, extra);
+
+let chatHistory = [];
+
+async function loadVideos() {
+  const res = await fetch('/api/videos');
+  const { videos } = await res.json();
+  $('video-select').innerHTML = videos.map(v => `<option>${v}</option>`).join('')
+    || '<option disabled>no videos in raw_videos/</option>';
+}
+
+$('analyze-btn').onclick = async () => {
+  const video = $('video-select').value;
+  if (!video) return;
+  $('analyze-btn').disabled = true;
+  $('status').textContent = 'starting...';
+  $('progress-wrap').style.display = 'block';
+  try {
+    const res = await fetch('/api/analyze', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ video })
+    });
+    if (!res.ok) throw new Error((await res.json()).detail);
+    const { job_id } = await res.json();
+    await poll(job_id);
+  } catch (e) {
+    $('status').textContent = 'error: ' + e.message;
+  } finally {
+    $('analyze-btn').disabled = false;
+  }
+};
+
+async function poll(jobId) {
+  for (;;) {
+    const job = await (await fetch(`/api/jobs/${jobId}`)).json();
+    if (job.total) {
+      $('progress-fill').style.width = (100 * job.progress / job.total) + '%';
+      $('status').textContent = `frame ${job.progress}/${job.total}`;
+    }
+    if (job.status === 'done') { render(job.result); return; }
+    if (job.status === 'error') { $('status').textContent = 'error: ' + job.error; return; }
+    await new Promise(r => setTimeout(r, 700));
+  }
+}
+
+function render(result) {
+  $('status').textContent = 'done: ' + result.video;
+  $('progress-wrap').style.display = 'none';
+  $('insights').style.display = 'block';
+  $('insights').textContent = result.insights;
+  addMsg('sys', 'System', 'Analysis of "' + result.video + '" loaded — ask away.');
+
+  const m = result.metrics;
+  const t = m.map(r => r.time);
+  const line = (col, name) => ({ x: t, y: m.map(r => r[col]), name, mode: 'lines' });
+
+  Plotly.newPlot('chart-height', [line('flyer_height', 'flyer height')],
+    layout({ title: 'Flyer Height' }), { displayModeBar: false });
+  Plotly.newPlot('chart-score', [line('stunt_score', 'score')],
+    layout({ title: 'Stunt Score' }), { displayModeBar: false });
+  Plotly.newPlot('chart-wobble', [line('base_wobble', 'base'), line('flyer_wobble', 'flyer')],
+    layout({ title: 'Wobble (TL)' }), { displayModeBar: false });
+  Plotly.newPlot('chart-plumb', [line('plumb_signed', 'offset')],
+    layout({ title: 'Plumb Offset (+ = flyer right of base)' }), { displayModeBar: false });
+}
+
+function addMsg(cls, who, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.innerHTML = `<span class="who">${who}:</span> `;
+  div.appendChild(document.createTextNode(text));
+  $('chat-log').appendChild(div);
+  $('chat-log').scrollTop = $('chat-log').scrollHeight;
+}
+
+$('chat-form').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('chat-input').value.trim();
+  if (!text) return;
+  $('chat-input').value = '';
+  addMsg('you', 'You', text);
+  $('chat-send').disabled = true;
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: chatHistory })
+    });
+    if (!res.ok) throw new Error((await res.json()).detail);
+    const { reply } = await res.json();
+    chatHistory.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
+    addMsg('ai', 'AI', reply);
+  } catch (err) {
+    addMsg('sys', 'System', err.message);
+  } finally {
+    $('chat-send').disabled = false;
+  }
+};
+
+loadVideos();
+</script>
+</body>
+</html>

@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 pip install -r requirements.txt
-python main.py
+python main.py                      # Tkinter desktop app
+python -m uvicorn server:app        # local web UI (POC) at http://127.0.0.1:8000
 ```
 
 Linting is not configured. The only dependency file is `requirements.txt`. The YOLOv8 pose model weights (`yolov8m-pose.pt`) download automatically on first run via ultralytics.
@@ -22,6 +23,7 @@ A Tkinter desktop app for analyzing cheer/acro stunts — it tracks two performe
 - **`stats.py`** — `LiveStats`: per-frame stats panel metrics; keeps the rolling CoM histories and returns formatted strings for the panel.
 - **`insights.py`** — post-run metrics DataFrame, rule-based coaching insights, Plotly report, LLM context summary, and `DeepSeekClient`.
 - **`main.py`** — `StuntCVApp`: Tkinter UI, playback loop, ROI/crop dragging, export dialogs, analysis orchestration, and the AI chat window. Should contain only UI concerns and glue — put new logic in the headless modules.
+- **`server.py` + `web/index.html`** — FastAPI local web UI (POC, the planned successor to the Tk app — see `TODO.md`). JSON API: `/api/videos`, `/api/analyze` (background job, one at a time — `PoseTracker` is not thread-safe), `/api/jobs/{id}` (polling), `/api/chat` (DeepSeek proxy; key from `DEEPSEEK_API_KEY` server-side only). Binds localhost, no auth.
 
 ### Pose Model
 

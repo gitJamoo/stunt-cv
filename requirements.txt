@@ -6,3 +6,5 @@ Pillow
 pandas
 plotly
 requests
+fastapi
+uvicorn
