@@ -245,6 +245,15 @@ function render(result) {
 // Used both on load and after a role reassignment (which returns the full
 // recomputed analysis)
 function applyAnalysis(result) {
+  if (!result.tracks || !result.role_map) {
+    // Old-format data: the running server predates the current frontend
+    analysis = null;
+    $('player-section').style.display = 'none';
+    $('results-section').style.display = 'none';
+    $('status').textContent =
+      'server is running old code — restart it (Ctrl+C, then "python -m uvicorn server:app") and re-run Analyze';
+    return;
+  }
   analysis = result;
 
   $('results-section').style.display = 'block';
@@ -304,7 +313,12 @@ async function showFrame(i) {
   }
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0);
-  if ($('overlay-chk').checked) drawOverlay(ctx, canvas.width, canvas.height);
+  // An overlay error must never take down playback with it
+  try {
+    if ($('overlay-chk').checked) drawOverlay(ctx, canvas.width, canvas.height);
+  } catch (err) {
+    console.error('overlay draw failed:', err);
+  }
 
   $('seek').value = frameIdx;
   const t = frameIdx / analysis.fps;
@@ -372,7 +386,13 @@ async function playLoop() {
   while (playing && analysis) {
     const started = performance.now();
     if (frameIdx >= analysis.frames - 1) { stopPlayback(); return; }
-    await showFrame(frameIdx + 1);
+    try {
+      await showFrame(frameIdx + 1);
+    } catch (err) {
+      console.error('frame advance failed:', err);
+      stopPlayback();
+      return;
+    }
     const budget = 1000 / (analysis.fps * parseFloat($('speed').value));
     const wait = budget - (performance.now() - started);
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
