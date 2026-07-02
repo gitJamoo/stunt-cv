@@ -108,7 +108,40 @@ def main():
     assert 'METRICS TIMELINE' in summary
     print(f"insights OK ({len(df)} frames, summary {len(summary)} chars)")
 
+    test_server_role_editing()
     print("ALL OK")
+
+
+def test_server_role_editing():
+    """Server-side role map editing + recompute from cached tracks (no HTTP)."""
+    import server
+
+    # Two synthetic people: track 1 low in frame (base-like), track 2 high
+    def person(tid, y):
+        kp = [[0.5, y + j * 0.005, 0.9] for j in range(17)]
+        return {'id': tid, 'kp': kp}
+
+    tracks = [[person(1, 0.6), person(2, 0.2)] for _ in range(20)]
+    role_map = [{'start': 0, 'roles': {'base': 1, 'flyer': 2}}]
+
+    df, text, summary = server._compute_results(tracks, role_map, 1000, 1000, 30.0)
+    assert len(df) == 20
+    flyer_h_before = df['flyer_height'].mean()
+
+    # Forward reassign at frame 10: flyer -> track 1 (displaces base to track 2)
+    server._apply_reassign(role_map, 10, 'flyer', 1, 'forward')
+    assert len(role_map) == 2 and role_map[1]['start'] == 10
+    assert role_map[1]['roles'] == {'base': 2, 'flyer': 1}, role_map[1]
+    assert role_map[0]['roles'] == {'base': 1, 'flyer': 2}   # untouched before frame 10
+
+    df2, _, _ = server._compute_results(tracks, role_map, 1000, 1000, 30.0)
+    # After the swap point the flyer is the low person, so mean height drops
+    assert df2['flyer_height'].mean() < flyer_h_before
+
+    # 'all' scope rewrites every segment
+    server._apply_reassign(role_map, 0, 'flyer', 2, 'all')
+    assert all(seg['roles']['flyer'] == 2 for seg in role_map)
+    print("server role editing OK")
 
 
 if __name__ == "__main__":

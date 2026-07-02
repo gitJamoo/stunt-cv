@@ -5,15 +5,23 @@ Run from the repo root:
     uvicorn server:app --port 8000
     # or: python server.py
 
-Then open http://127.0.0.1:8000. Serves the frontend from web/, exposes the
-analysis pipeline (tracking → metrics → insights) and the DeepSeek chat as a
-JSON API, streams raw frames as JPEGs for the canvas player (skeletons are
-drawn client-side from the per-frame poses in the analysis result), and
-persists finished analyses to analyses/<video>.json so reopening a video
-doesn't re-run inference.
+Then open http://127.0.0.1:8000.
 
-The DeepSeek key is read from the DEEPSEEK_API_KEY environment variable
-server-side; it is never sent to the browser.
+Analysis architecture: the expensive YOLO/ByteTrack pass produces
+role-AGNOSTIC data — every person on every frame with their persistent track
+ID and raw keypoints (`tracks`). Who is "base" and who is "flyer" is a
+separate, editable mapping (`role_map`: segments of frame → {role: track_id})
+recorded from the tracker's automatic assignment and adjustable afterwards
+via /api/reassign and /api/swap_roles. Corrections relabel and recompute
+metrics/insights from the cached keypoints in milliseconds — inference never
+re-runs. Role names are plain strings so the group-stunt generalization
+(docs/GROUP_STUNT_PLAN.md) extends ROLES rather than reworking the schema.
+
+Finished analyses persist to analyses/<video>.json (schema ANALYSIS_VERSION;
+older caches are rejected and simply re-run).
+
+The DeepSeek key comes from the browser request or the DEEPSEEK_API_KEY
+environment variable server-side; it is never sent to the browser.
 
 Local tool only: binds to localhost and has no auth — do not expose it to a
 network as-is.
@@ -30,7 +38,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import insights
-from pose_data import PoseSmoother, center_of_mass, torso_length, base_alignment_tl
+from pose_data import (Landmark, LandmarkList, PoseSmoother, SmoothedResults,
+                       base_alignment_tl, center_of_mass, torso_length)
 from tracking import PoseTracker
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +49,10 @@ ANALYSES_DIR = os.path.join(BASE_DIR, 'analyses')
 VIDEO_EXTS = ('.mp4', '.avi', '.mov')
 FRAME_MAX_W = 960      # frames served to the browser are downscaled to this width
 JPEG_QUALITY = 82
+
+ANALYSIS_VERSION = 2
+ROLES = ('base', 'flyer')   # group stunts will extend this list
+SMOOTH_WINDOW = 8
 
 app = FastAPI(title="Stunt CV")
 
@@ -74,10 +87,33 @@ def _analysis_path(video_name):
     return os.path.join(ANALYSES_DIR, os.path.splitext(os.path.basename(video_name))[0] + '.json')
 
 
+def _load_analysis(video_name):
+    path = _analysis_path(video_name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "no cached analysis — run /api/analyze")
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    if data.get('version') != ANALYSIS_VERSION:
+        raise HTTPException(404, "cached analysis uses an old format — re-run /api/analyze")
+    return data
+
+
 class AnalyzeRequest(BaseModel):
     video: str
     max_frames: int | None = None   # for quick test runs
     conf: float = 0.4
+
+
+class ReassignRequest(BaseModel):
+    video: str
+    role: str                       # one of ROLES
+    track_id: int
+    frame: int = 0
+    scope: str = 'forward'          # 'forward' (from `frame` on) or 'all'
+
+
+class SwapRequest(BaseModel):
+    video: str
 
 
 class ChatRequest(BaseModel):
@@ -140,15 +176,11 @@ def get_frame(video: str, index: int):
 @app.get("/api/analysis/{video}")
 def get_cached_analysis(video: str):
     """Previously computed analysis for this video, if any."""
-    path = _analysis_path(video)
-    if not os.path.isfile(path):
-        raise HTTPException(404, "no cached analysis — run /api/analyze")
-    with open(path, encoding='utf-8') as f:
-        result = json.load(f)
+    data = _load_analysis(video)
     global _last_llm_summary
-    if result.get('llm_summary'):
-        _last_llm_summary = result['llm_summary']
-    return result
+    if data.get('llm_summary'):
+        _last_llm_summary = data['llm_summary']
+    return data
 
 
 @app.post("/api/analyze")
@@ -183,55 +215,156 @@ def cancel_job(job_id: str):
     return {"status": job['status']}
 
 
+@app.post("/api/reassign")
+def reassign(req: ReassignRequest):
+    """Bind a role to a track ID from a given frame on (or everywhere) and
+    recompute metrics/insights from the cached tracks — no re-inference."""
+    if req.role not in ROLES:
+        raise HTTPException(400, f"unknown role {req.role!r} (want one of {ROLES})")
+    data = _load_analysis(req.video)
+    if req.scope not in ('forward', 'all'):
+        raise HTTPException(400, "scope must be 'forward' or 'all'")
+    _apply_reassign(data['role_map'], req.frame, req.role, req.track_id, req.scope)
+    return _rebuild_analysis(data)
+
+
+@app.post("/api/swap_roles")
+def swap_roles(req: SwapRequest):
+    """Exchange base and flyer along the whole video."""
+    data = _load_analysis(req.video)
+    for seg in data['role_map']:
+        r = seg['roles']
+        r['base'], r['flyer'] = r.get('flyer'), r.get('base')
+    return _rebuild_analysis(data)
+
+
+def _apply_reassign(role_map, frame, role, track_id, scope):
+    """Mutates role_map. Swap semantics: if the target track already holds
+    another role in a segment, the displaced role inherits this role's old
+    track (matching the desktop right-click behavior)."""
+    def set_role(roles):
+        for other, tid in list(roles.items()):
+            if other != role and tid == track_id:
+                roles[other] = roles.get(role)
+        roles[role] = track_id
+
+    if not role_map:
+        role_map.append({'start': 0, 'roles': {r: None for r in ROLES}})
+    if scope == 'all':
+        for seg in role_map:
+            set_role(seg['roles'])
+        return
+    # forward: split the covering segment at `frame`, apply from there on
+    idx = 0
+    for j, seg in enumerate(role_map):
+        if seg['start'] <= frame:
+            idx = j
+        else:
+            break
+    if role_map[idx]['start'] < frame:
+        role_map.insert(idx + 1, {'start': frame, 'roles': dict(role_map[idx]['roles'])})
+        idx += 1
+    for seg in role_map[idx:]:
+        set_role(seg['roles'])
+
+
 def _run_analysis_job(job_id, video_path, max_frames, conf):
-    global _last_llm_summary
     job = _jobs[job_id]
     try:
-        rows, pose_frames, w, h, fps = _process_video(job, video_path, max_frames, conf)
+        tracks, role_map, w, h, fps = _process_video(job, video_path, max_frames, conf)
         if job['cancel']:
             job['status'] = 'cancelled'
             return
-        df = insights.compute_metrics(rows, w, h, fps)
-        text = insights.generate_insights(df, fps)
-        llm_summary = insights.summarize_for_llm(df, fps, text)
-        _last_llm_summary = llm_summary
-        result = {
+        data = {
+            'version': ANALYSIS_VERSION,
             'video': os.path.basename(video_path),
-            'fps': fps,
-            'width': w,
-            'height': h,
-            'frames': len(rows),
-            'insights': text,
-            'llm_summary': llm_summary,
-            # to_json handles NaN -> null, which raw to_dict does not
-            'metrics': json.loads(df.round(4).to_json(orient='records')),
-            'poses': pose_frames,
+            'fps': fps, 'width': w, 'height': h, 'frames': len(tracks),
+            'roles': list(ROLES),
+            'role_map': role_map,
+            'tracks': tracks,
         }
-        os.makedirs(ANALYSES_DIR, exist_ok=True)
-        with open(_analysis_path(video_path), 'w', encoding='utf-8') as f:
-            json.dump(result, f)
-        job['result'] = result
+        job['result'] = _rebuild_analysis(data)
         job['status'] = 'done'
     except Exception as e:
         job['status'] = 'error'
         job['error'] = str(e)
 
 
-def _pose_to_list(lm_list):
+def _rebuild_analysis(data):
+    """Compute metrics/insights from cached tracks + role_map, persist, and
+    return the full analysis dict. Single source of truth for both the
+    initial analysis and every subsequent role correction."""
+    global _last_llm_summary
+    df, text, llm_summary = _compute_results(
+        data['tracks'], data['role_map'], data['width'], data['height'], data['fps'])
+    data['insights'] = text
+    data['llm_summary'] = llm_summary
+    data['metrics'] = json.loads(df.round(4).to_json(orient='records'))
+    _last_llm_summary = llm_summary
+    os.makedirs(ANALYSES_DIR, exist_ok=True)
+    with open(_analysis_path(data['video']), 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+    return data
+
+
+def _pose_to_kp(lm_list):
     """LandmarkList -> [[x, y, visibility], ...] rounded for compact JSON."""
-    return [[round(l.x, 3), round(l.y, 3), round(l.visibility, 2)] for l in lm_list.landmark]
+    return [[round(l.x, 4), round(l.y, 4), round(l.visibility, 2)] for l in lm_list.landmark]
+
+
+def _kp_to_landmarks(kp):
+    return LandmarkList([Landmark(x=p[0], y=p[1], visibility=p[2]) for p in kp])
+
+
+def _roles_at(role_map, seg_idx, frame):
+    """Advance the segment cursor to cover `frame`; returns (roles, seg_idx)."""
+    while seg_idx + 1 < len(role_map) and role_map[seg_idx + 1]['start'] <= frame:
+        seg_idx += 1
+    roles = role_map[seg_idx]['roles'] if role_map else {}
+    return roles, seg_idx
+
+
+def _compute_results(tracks, role_map, w, h, fps):
+    """Metrics DataFrame + insights from cached role-agnostic tracks."""
+    smoothers = {r: PoseSmoother(SMOOTH_WINDOW) for r in ROLES}
+    rows = []
+    seg_idx = 0
+    for i, people in enumerate(tracks):
+        roles, seg_idx = _roles_at(role_map, seg_idx, i)
+        by_id = {p['id']: p for p in people}
+        lm = {}
+        for r in ROLES:
+            person = by_id.get(roles.get(r))
+            raw = SmoothedResults(_kp_to_landmarks(person['kp'])) if person else None
+            smoothed = smoothers[r].smooth(raw)
+            lm[r] = smoothed.pose_landmarks if smoothed else None
+
+        base_com = center_of_mass(lm['base'], w, h)
+        flyer_com = center_of_mass(lm['flyer'], w, h)
+        base_torso = torso_length(lm['base'], w, h)
+        rows.append({
+            'frame': i,
+            'base_com_x':  base_com[0]  if base_com  else None,
+            'base_com_y':  base_com[1]  if base_com  else None,
+            'flyer_com_x': flyer_com[0] if flyer_com else None,
+            'flyer_com_y': flyer_com[1] if flyer_com else None,
+            'ref_torso': base_torso or torso_length(lm['flyer'], w, h),
+            'alignment_tl': base_alignment_tl(lm['base'], w, base_torso),
+        })
+    df = insights.compute_metrics(rows, w, h, fps)
+    text = insights.generate_insights(df, fps)
+    llm_summary = insights.summarize_for_llm(df, fps, text)
+    return df, text, llm_summary
 
 
 def _process_video(job, video_path, max_frames, conf):
-    """Same per-frame pass as the desktop Analyze button, minus the UI.
-    Also captures per-frame poses so the browser can draw skeleton overlays:
-    each entry is {'b': base_kp|None, 'f': flyer_kp|None, 's': [spotter_kp,...]}
-    (base/flyer smoothed to match the desktop rendering, spotters raw)."""
+    """The expensive pass: YOLO + ByteTrack over every frame. Produces
+    role-agnostic `tracks` (all people, raw keypoints, persistent IDs) and
+    the tracker's automatic `role_map` as the starting role assignment."""
     with _tracker_lock:
         tracker = _get_tracker()
         tracker.reset()
         state = PoseTracker.new_state()
-        base_sm, flyer_sm = PoseSmoother(8), PoseSmoother(8)
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -244,40 +377,23 @@ def _process_video(job, video_path, max_frames, conf):
             total = min(total, max_frames)
         job['total'] = total
 
-        rows, pose_frames = [], []
+        tracks, role_map = [], []
         for i in range(total):
             if job['cancel']:
                 break
             ret, frame = cap.read()
             if not ret:
                 break
-            base, flyer = tracker.detect_auto(frame, state, conf)
-            sb, sf = base_sm.smooth(base), flyer_sm.smooth(flyer)
-
-            base_lm = sb.pose_landmarks if sb else None
-            flyer_lm = sf.pose_landmarks if sf else None
-            base_com = center_of_mass(base_lm, w, h)
-            flyer_com = center_of_mass(flyer_lm, w, h)
-            base_torso = torso_length(base_lm, w, h)
-            rows.append({
-                'frame': i,
-                'base_com_x':  base_com[0]  if base_com  else None,
-                'base_com_y':  base_com[1]  if base_com  else None,
-                'flyer_com_x': flyer_com[0] if flyer_com else None,
-                'flyer_com_y': flyer_com[1] if flyer_com else None,
-                'ref_torso': base_torso or torso_length(flyer_lm, w, h),
-                'alignment_tl': base_alignment_tl(base_lm, w, base_torso),
-            })
-            pose_frames.append({
-                'b': _pose_to_list(base_lm) if base_lm else None,
-                'f': _pose_to_list(flyer_lm) if flyer_lm else None,
-                's': [_pose_to_list(p) for p in tracker.last_poses
-                      if p is not tracker.raw_base and p is not tracker.raw_flyer],
-            })
+            tracker.detect_auto(frame, state, conf)
+            tracks.append([{'id': tid, 'kp': _pose_to_kp(pose)}
+                           for tid, pose in zip(tracker.last_ids, tracker.last_poses)])
+            current = {r: state[f'{r}_id'] for r in ROLES}
+            if not role_map or role_map[-1]['roles'] != current:
+                role_map.append({'start': i, 'roles': current})
             job['progress'] = i + 1
         cap.release()
         tracker.reset()
-    return rows, pose_frames, w, h, fps
+    return tracks, role_map, w, h, fps
 
 
 # ----------------------------------------------------------------------

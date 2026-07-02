@@ -81,9 +81,12 @@
           <option value="1" selected>1×</option>
         </select>
         <label style="font-size:13px;color:#9aa4b2"><input id="overlay-chk" type="checkbox" checked> overlay</label>
+        <button id="swap-btn" class="secondary">Swap roles</button>
       </div>
       <div class="legend"><span class="b">■ base</span> &nbsp; <span class="f">■ flyer</span> &nbsp; <span class="s">■ spotters</span>
-        &nbsp;·&nbsp; space = play/pause, ←/→ = frame step, click a chart to jump there</div>
+        &nbsp;·&nbsp; space = play/pause, ←/→ = frame step, click a chart to jump there.
+        <b>Wrong labels? Click a person on the video to reassign.</b></div>
+      <div id="assign-menu" style="display:none;position:fixed;z-index:10;background:#262b35;border:1px solid #3a4050;border-radius:8px;padding:6px;box-shadow:0 4px 16px rgba(0,0,0,.5)"></div>
     </section>
 
     <section id="results-section" style="display:none">
@@ -119,7 +122,7 @@ const $ = id => document.getElementById(id);
 const CONN = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],
               [5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
 const VIS = 0.4;
-const COLORS = { b: '#ff4d4d', f: '#4da3ff' };
+const COLORS = { base: '#ff4d4d', flyer: '#4da3ff' };
 
 const layout = extra => Object.assign({
   paper_bgcolor: '#1c1f26', plot_bgcolor: '#1c1f26',
@@ -232,14 +235,21 @@ async function poll(jobId) {
 // ---------------------------------------------------------------- results
 
 function render(result) {
-  analysis = result;
   frameCache.clear();
   frameIdx = 0;
+  addMsg('sys', 'System', `Analysis of "${result.video}" loaded — ask away.`);
+  applyAnalysis(result);
+  showFrame(0);
+}
+
+// Used both on load and after a role reassignment (which returns the full
+// recomputed analysis)
+function applyAnalysis(result) {
+  analysis = result;
 
   $('results-section').style.display = 'block';
   $('insights').style.display = 'block';
   $('insights').textContent = result.insights;
-  addMsg('sys', 'System', `Analysis of "${result.video}" loaded — ask away.`);
 
   const m = result.metrics;
   const t = m.map(r => r.time);
@@ -257,7 +267,6 @@ function render(result) {
 
   $('player-section').style.display = 'block';
   $('seek').max = result.frames - 1;
-  showFrame(0);
 }
 
 // ---------------------------------------------------------------- player
@@ -306,12 +315,43 @@ async function showFrame(i) {
   fetchFrame(Math.min(frameIdx + 1, analysis.frames - 1));  // prefetch
 }
 
+function rolesAt(frame) {
+  let roles = {};
+  for (const seg of analysis.role_map) {
+    if (seg.start <= frame) roles = seg.roles; else break;
+  }
+  return roles;   // {base: trackId|null, flyer: trackId|null}
+}
+
 function drawOverlay(ctx, w, h) {
-  const pose = analysis.poses[frameIdx];
-  if (!pose) return;
-  for (const kp of pose.s) drawSkeleton(ctx, kp, w, h, '#8a8a8a', 1.5);
-  if (pose.b) drawSkeleton(ctx, pose.b, w, h, COLORS.b, 3.5);
-  if (pose.f) drawSkeleton(ctx, pose.f, w, h, COLORS.f, 3.5);
+  const people = analysis.tracks[frameIdx] || [];
+  const roles = rolesAt(frameIdx);
+  const roleOf = {};
+  for (const [role, tid] of Object.entries(roles)) if (tid != null) roleOf[tid] = role;
+
+  for (const p of people)   // spotters first, under the pair
+    if (!roleOf[p.id]) drawSkeleton(ctx, p.kp, w, h, '#8a8a8a', 1.5);
+  for (const p of people) {
+    const role = roleOf[p.id];
+    if (!role) continue;
+    drawSkeleton(ctx, p.kp, w, h, COLORS[role], 3.5);
+    drawLabel(ctx, p.kp, w, h, role.toUpperCase(), COLORS[role]);
+  }
+}
+
+function drawLabel(ctx, kp, w, h, text, color) {
+  // Anchor above the highest visible keypoint
+  let top = null;
+  for (const p of kp) if (p[2] > VIS && (top === null || p[1] < top[1])) top = p;
+  if (!top) return;
+  ctx.font = 'bold 15px Segoe UI, sans-serif';
+  ctx.fillStyle = color;
+  ctx.strokeStyle = 'rgba(0,0,0,.7)';
+  ctx.lineWidth = 3;
+  const x = top[0] * w - ctx.measureText(text).width / 2;
+  const y = Math.max(16, top[1] * h - 12);
+  ctx.strokeText(text, x, y);
+  ctx.fillText(text, x, y);
 }
 
 function drawSkeleton(ctx, kp, w, h, color, width) {
@@ -362,6 +402,81 @@ $('step-back').onclick = () => seekTo(frameIdx - 1);
 $('step-fwd').onclick = () => seekTo(frameIdx + 1);
 $('seek').oninput = e => seekTo(parseInt(e.target.value));
 $('overlay-chk').onchange = () => showFrame(frameIdx);
+
+// ------------------------------------------------------- role correction
+
+$('swap-btn').onclick = async () => {
+  if (!analysis) return;
+  await roleRequest('/api/swap_roles', { video: analysis.video });
+};
+
+$('player-canvas').onclick = e => {
+  if (!analysis) return;
+  hideAssignMenu();
+  const canvas = $('player-canvas');
+  const nx = e.offsetX / canvas.clientWidth;
+  const ny = e.offsetY / canvas.clientHeight;
+  const people = analysis.tracks[frameIdx] || [];
+  let best = null, bestDist = 0.15;   // ignore clicks far from anyone
+  for (const p of people) {
+    const vis = p.kp.filter(k => k[2] > 0.3);
+    if (!vis.length) continue;
+    const cx = vis.reduce((s, k) => s + k[0], 0) / vis.length;
+    const cy = vis.reduce((s, k) => s + k[1], 0) / vis.length;
+    const d = Math.hypot(cx - nx, cy - ny);
+    if (d < bestDist) { bestDist = d; best = p; }
+  }
+  if (!best) return;
+  showAssignMenu(e.clientX, e.clientY, best.id);
+};
+
+function showAssignMenu(x, y, trackId) {
+  stopPlayback();
+  const menu = $('assign-menu');
+  const item = (label, role, scope) =>
+    `<div class="menu-item" data-role="${role}" data-scope="${scope}"
+         style="padding:7px 14px;cursor:pointer;border-radius:5px;font-size:13px">${label}</div>`;
+  menu.innerHTML =
+    item('Set as BASE from here', 'base', 'forward') +
+    item('Set as FLYER from here', 'flyer', 'forward') +
+    item('Set as BASE (whole video)', 'base', 'all') +
+    item('Set as FLYER (whole video)', 'flyer', 'all');
+  menu.style.left = Math.min(x, innerWidth - 230) + 'px';
+  menu.style.top = Math.min(y, innerHeight - 160) + 'px';
+  menu.style.display = 'block';
+  for (const el of menu.querySelectorAll('.menu-item')) {
+    el.onmouseenter = () => el.style.background = '#3a4050';
+    el.onmouseleave = () => el.style.background = '';
+    el.onclick = () => {
+      hideAssignMenu();
+      roleRequest('/api/reassign', {
+        video: analysis.video, role: el.dataset.role, scope: el.dataset.scope,
+        track_id: trackId, frame: frameIdx,
+      });
+    };
+  }
+}
+
+function hideAssignMenu() { $('assign-menu').style.display = 'none'; }
+document.addEventListener('click', e => {
+  if (!$('assign-menu').contains(e.target) && e.target !== $('player-canvas')) hideAssignMenu();
+});
+
+async function roleRequest(url, body) {
+  $('status').textContent = 'updating roles...';
+  try {
+    const res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error((await res.json()).detail);
+    applyAnalysis(await res.json());   // metrics/insights recomputed server-side
+    showFrame(frameIdx);
+    $('status').textContent = 'roles updated';
+  } catch (err) {
+    $('status').textContent = 'role update failed: ' + err.message;
+  }
+}
 
 document.addEventListener('keydown', e => {
   if (!analysis || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;

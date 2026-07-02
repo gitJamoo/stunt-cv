@@ -12,7 +12,7 @@ Goal: move from the Tkinter desktop app to a polished local web UI.
 - [x] Cancel button for running analyses
 - [x] Persist analyses (`analyses/<video>.json`, auto-loaded on video select)
 - [x] Browser API key field (localStorage) with server env fallback
-- [ ] Role correction on web: click a person to set base/flyer (needs per-frame track IDs in the API + partial re-analysis from the corrected frame)
+- [x] Role correction on web: click a person on the video → set base/flyer (from here / whole video), plus a Swap button. Analyses store role-agnostic tracks + an editable `role_map`; corrections recompute from cache without re-running YOLO — this is the foundation the group-stunt plan builds on
 - [ ] Progress over WebSocket instead of polling
 - [ ] Streamed chat responses (DeepSeek SSE)
 - [ ] Smoother playback: pre-encoded annotated MP4 as an alternative to per-frame JPEG fetches for long videos
