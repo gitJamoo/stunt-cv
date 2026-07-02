@@ -1,15 +1,19 @@
 import cv2
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, scrolledtext
 from PIL import Image, ImageTk
 import numpy as np
 import csv
+import threading
+import webbrowser
 from collections import deque
 from ultralytics import YOLO
 
 import pandas as pd
 import plotly.express as px
 import os
+
+import insights
 
 # COCO 17-keypoint skeleton connections used for drawing
 YOLO_CONNECTIONS = [
@@ -149,6 +153,13 @@ class StuntCVApp:
         self._inversion_count = 0
         self.role_hint_var = tk.StringVar(value="")
 
+        # Analysis / AI Chat State
+        self.analysis_df = None
+        self.analysis_fps = None
+        self.analysis_insights = ""
+        self.chat_window = None
+        self.chat_messages = []
+
         # Stats State
         self.last_com_base = None
         self.last_com_flyer = None
@@ -217,6 +228,10 @@ class StuntCVApp:
         self.btn_save_viz.pack(side=tk.LEFT, padx=5)
         self.btn_swap = tk.Button(self.controls_frame, text="Swap Base/Flyer", command=self.swap_roles)
         self.btn_swap.pack(side=tk.LEFT, padx=5)
+        self.btn_analyze = tk.Button(self.controls_frame, text="Analyze", command=self.run_analysis)
+        self.btn_analyze.pack(side=tk.LEFT, padx=5)
+        self.btn_chat = tk.Button(self.controls_frame, text="AI Chat", command=self.open_ai_chat)
+        self.btn_chat.pack(side=tk.LEFT, padx=5)
 
         self.chk_roi = tk.Checkbutton(self.controls_frame, text="Enable ROI Tracking", var=self.roi_tracking_enabled, command=self.on_roi_toggle)
         self.chk_roi.pack(side=tk.LEFT, padx=10)
@@ -920,6 +935,189 @@ class StuntCVApp:
         for lm in lm_list.landmark:
             lm.x = (lm.x * crop_w + crop_x) / frame_w
             lm.y = (lm.y * crop_h + crop_y) / frame_h
+
+    def run_analysis(self):
+        """Re-processes the whole video, builds a metrics DataFrame, opens an
+        interactive Plotly report, and feeds the results to the AI chat."""
+        if not self.video_path:
+            messagebox.showwarning("No Video", "Please open a video file first.")
+            return
+        self.playing = False
+
+        cap = cv2.VideoCapture(self.video_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        progress_dialog = tk.Toplevel(self.root)
+        progress_dialog.title("Analyzing...")
+        progress_label = tk.Label(progress_dialog, text=f"Processing frame 0/{num_frames}")
+        progress_label.pack(padx=20, pady=10)
+        progress_dialog.geometry(f"+{self.root.winfo_x()+150}+{self.root.winfo_y()+150}")
+        self.root.update_idletasks()
+
+        ana_base_sm  = PoseSmoother(self.smoothing_window_var.get())
+        ana_flyer_sm = PoseSmoother(self.smoothing_window_var.get())
+        ana_state = self._new_track_state()
+        self._reset_tracker()  # analysis re-runs the video from frame 0
+        roi_enabled = self.roi_tracking_enabled.get()
+
+        rows = []
+        for i in range(num_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if roi_enabled:
+                base_results, flyer_results = self.find_poses_by_roi(frame)
+            else:
+                base_results, flyer_results = self._detect_poses_auto(frame, ana_state)
+            smoothed_base  = ana_base_sm.smooth(base_results)
+            smoothed_flyer = ana_flyer_sm.smooth(flyer_results)
+
+            base_lm  = smoothed_base.pose_landmarks  if smoothed_base  else None
+            flyer_lm = smoothed_flyer.pose_landmarks if smoothed_flyer else None
+            base_com   = self.calculate_center_of_mass(base_lm, w, h)
+            flyer_com  = self.calculate_center_of_mass(flyer_lm, w, h)
+            base_torso = self.get_torso_length(base_lm, w, h)
+            ref_torso  = base_torso or self.get_torso_length(flyer_lm, w, h)
+
+            alignment_tl = None
+            if base_lm and base_torso:
+                lm = base_lm.landmark
+                shoulder_x = (lm[KP_L_SHOULDER].x + lm[KP_R_SHOULDER].x) / 2
+                hip_x      = (lm[KP_L_HIP].x      + lm[KP_R_HIP].x)      / 2
+                ankle_x    = (lm[KP_L_ANKLE].x     + lm[KP_R_ANKLE].x)    / 2
+                alignment_tl = (abs(shoulder_x - hip_x) + abs(hip_x - ankle_x)) * w / base_torso
+
+            rows.append({
+                'frame': i,
+                'base_com_x':  base_com[0]  if base_com  else None,
+                'base_com_y':  base_com[1]  if base_com  else None,
+                'flyer_com_x': flyer_com[0] if flyer_com else None,
+                'flyer_com_y': flyer_com[1] if flyer_com else None,
+                'ref_torso': ref_torso,
+                'alignment_tl': alignment_tl,
+            })
+            progress_label.config(text=f"Processing frame {i+1}/{num_frames}")
+            self.root.update_idletasks()
+
+        cap.release()
+        progress_dialog.destroy()
+        self._reset_tracker()
+        self._invalidate_role_ids()
+
+        self.analysis_df = insights.compute_metrics(rows, w, h, fps)
+        self.analysis_fps = fps
+        self.analysis_insights = insights.generate_insights(self.analysis_df, fps)
+
+        report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'edited_videos')
+        os.makedirs(report_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(self.video_path))[0]
+        html_path = os.path.join(report_dir, f"{stem}_analysis.html")
+        insights.build_analysis_html(self.analysis_df, html_path, self.analysis_insights)
+        webbrowser.open(os.path.abspath(html_path))
+
+        chat_was_open = self.chat_window is not None and self.chat_window.winfo_exists()
+        self.open_ai_chat()
+        if chat_was_open:
+            self._append_chat("Insights", self.analysis_insights)
+
+    def open_ai_chat(self):
+        if self.chat_window is not None and self.chat_window.winfo_exists():
+            self.chat_window.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("AI Coach (DeepSeek)")
+        win.geometry("560x620")
+        self.chat_window = win
+
+        top = tk.Frame(win)
+        top.pack(fill=tk.X, padx=8, pady=4)
+        tk.Label(top, text="API Key:").pack(side=tk.LEFT)
+        self.api_key_entry = tk.Entry(top, show="*", width=22)
+        self.api_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.api_key_entry.insert(0, os.environ.get("DEEPSEEK_API_KEY", ""))
+        tk.Label(top, text="Model:").pack(side=tk.LEFT)
+        self.model_entry = tk.Entry(top, width=16)
+        self.model_entry.pack(side=tk.LEFT, padx=4)
+        self.model_entry.insert(0, "deepseek-chat")
+
+        self.chat_log = scrolledtext.ScrolledText(win, wrap=tk.WORD, state=tk.DISABLED, font=("Arial", 10))
+        self.chat_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        bottom = tk.Frame(win)
+        bottom.pack(fill=tk.X, padx=8, pady=6)
+        self.chat_entry = tk.Entry(bottom)
+        self.chat_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.chat_entry.bind("<Return>", lambda e: self.send_chat_message())
+        self.chat_send_btn = tk.Button(bottom, text="Send", command=self.send_chat_message)
+        self.chat_send_btn.pack(side=tk.LEFT, padx=4)
+
+        self.chat_messages = []
+        if self.analysis_insights:
+            self._append_chat("Insights", self.analysis_insights)
+        else:
+            self._append_chat("System", "Tip: run Analyze first so the AI can see your stunt's metrics.")
+
+    def _append_chat(self, sender, text):
+        self.chat_log.config(state=tk.NORMAL)
+        self.chat_log.insert(tk.END, f"{sender}: {text}\n\n")
+        self.chat_log.config(state=tk.DISABLED)
+        self.chat_log.see(tk.END)
+
+    def send_chat_message(self):
+        text = self.chat_entry.get().strip()
+        if not text:
+            return
+        api_key = self.api_key_entry.get().strip()
+        if not api_key:
+            self._append_chat("System", "Enter your DeepSeek API key first (or set DEEPSEEK_API_KEY).")
+            return
+        model = self.model_entry.get().strip() or "deepseek-chat"
+        self.chat_entry.delete(0, tk.END)
+        self._append_chat("You", text)
+        self.chat_messages.append({"role": "user", "content": text})
+
+        if self.analysis_df is not None and not self.analysis_df.empty:
+            context = insights.summarize_for_llm(self.analysis_df, self.analysis_fps, self.analysis_insights)
+        else:
+            context = "No analysis has been run yet — answer general stunt questions."
+        system_prompt = (
+            "You are an experienced cheerleading/acro stunt coach. The user analyzed a stunt video "
+            "with pose tracking (base and flyer). Answer their questions using the data below when "
+            "relevant. Be concrete and concise.\n\n" + context
+        )
+        # Keep the last 12 turns so the prompt stays small
+        messages = [{"role": "system", "content": system_prompt}] + self.chat_messages[-12:]
+
+        self.chat_send_btn.config(state=tk.DISABLED)
+        self._append_chat("AI", "(thinking...)")
+
+        def worker():
+            reply, error = None, None
+            try:
+                reply = insights.DeepSeekClient(api_key, model).chat(messages)
+            except Exception as e:
+                error = str(e)
+            self.root.after(0, lambda: self._on_chat_reply(reply, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_chat_reply(self, reply, error):
+        if self.chat_window is None or not self.chat_window.winfo_exists():
+            return
+        # Remove the "(thinking...)" placeholder line
+        self.chat_log.config(state=tk.NORMAL)
+        self.chat_log.delete("end-3l", tk.END)
+        self.chat_log.insert(tk.END, "\n")
+        self.chat_log.config(state=tk.DISABLED)
+        if error:
+            self._append_chat("System", f"Request failed: {error}")
+        else:
+            self.chat_messages.append({"role": "assistant", "content": reply})
+            self._append_chat("AI", reply)
+        self.chat_send_btn.config(state=tk.NORMAL)
 
     def save_video(self):
         if not self.video_path: messagebox.showwarning("No Video", "Please open a video file first."); return

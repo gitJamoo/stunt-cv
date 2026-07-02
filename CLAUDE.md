@@ -13,7 +13,7 @@ There are no tests or linting configured. The only dependency file is `requireme
 
 ## Architecture
 
-The entire application lives in a single file: `main.py`. It is a Tkinter desktop GUI app for analyzing cheer/acro stunts — it tracks two performers (a "base" and a "flyer") in video using YOLOv8-pose.
+The application is two files: `main.py` (all UI, playback, detection, tracking, export) and `insights.py` (post-run metrics DataFrame, rule-based coaching insights, Plotly report, and the DeepSeek chat client — everything headless/testable without Tk). It is a Tkinter desktop GUI app for analyzing cheer/acro stunts — it tracks two performers (a "base" and a "flyer") in video using YOLOv8-pose.
 
 Classes:
 
@@ -64,6 +64,12 @@ All stats are normalized by **torso length** (`get_torso_length`, shoulder-to-hi
 - **Alignment** (base): Horizontal deviation across shoulder/hip/ankle stack.
 - **Plumb Line**: Horizontal offset between base and flyer CoMs.
 - **Stunt Score**: Weighted: flyer height 40%, flyer wobble 30%, plumb line 30%.
+
+### Analysis & AI Chat
+
+The **Analyze** button re-processes the video (same pattern as exports: own track state + smoothers, tracker resets around the pass), collects per-frame CoM/torso rows, and hands them to `insights.compute_metrics()` → a DataFrame of normalized metrics (height, velocity, wobble, plumb, stunt score per frame). It then writes an interactive Plotly report to `edited_videos/<video>_analysis.html` (auto-opened in the browser), generates rule-based coaching notes (`insights.generate_insights`), and opens the chat window.
+
+The **AI Chat** button opens a Toplevel chat box backed by `insights.DeepSeekClient` (plain `requests` against DeepSeek's OpenAI-compatible `/chat/completions`). The API key comes from the window's entry field or `DEEPSEEK_API_KEY`; the model name is editable (default `deepseek-chat`). Each send builds a system prompt from `insights.summarize_for_llm()` — the coaching notes plus a downsampled metrics CSV — and the API call runs on a worker thread, posting back via `root.after`.
 
 ### Output Directories
 
