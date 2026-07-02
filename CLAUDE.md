@@ -9,40 +9,42 @@ pip install -r requirements.txt
 python main.py
 ```
 
-There are no tests or linting configured. The only dependency file is `requirements.txt`. The YOLOv8 pose model weights (`yolov8m-pose.pt`) download automatically on first run via ultralytics.
+Linting is not configured. The only dependency file is `requirements.txt`. The YOLOv8 pose model weights (`yolov8m-pose.pt`) download automatically on first run via ultralytics.
+
+**Test:** `python tests/smoke_test.py [video]` — headless (no Tk) end-to-end check of tracking, role rebinding, smoothing, and the insights pipeline against a real video (defaults to the first .mp4 in `raw_videos/`). Run it after touching tracking or analysis code.
 
 ## Architecture
 
-The application is two files: `main.py` (all UI, playback, detection, tracking, export) and `insights.py` (post-run metrics DataFrame, rule-based coaching insights, Plotly report, and the DeepSeek chat client — everything headless/testable without Tk). It is a Tkinter desktop GUI app for analyzing cheer/acro stunts — it tracks two performers (a "base" and a "flyer") in video using YOLOv8-pose.
+A Tkinter desktop app for analyzing cheer/acro stunts — it tracks two performers (a "base" and a "flyer") in video using YOLOv8-pose. Everything except `main.py` is headless (no Tkinter) and importable in tests:
 
-Classes:
-
-- **`Landmark` / `LandmarkList` / `SmoothedResults`** — thin wrappers that mimic the old MediaPipe result shape (`.pose_landmarks.landmark[i].x/.y/.visibility`, normalized 0–1 coordinates). All YOLO output is converted into these via `_yolo_to_landmarks()`, so downstream code (smoothing, drawing, stats, export) is detector-agnostic.
-- **`PoseSmoother`** — boxcar-averages landmarks over a rolling window and holds the last smoothed pose through short detection gaps (`max_gap` frames) so brief occlusions don't snap the skeleton.
-- **`StuntCVApp`** — everything else: UI layout, video playback, detection, tracking, smoothing, stats, and export.
+- **`pose_data.py`** — keypoint constants (`KP_*`, `YOLO_CONNECTIONS`), data types, and pure geometry: `Landmark`/`LandmarkList`/`SmoothedResults` (thin wrappers that mimic the old MediaPipe result shape — `.pose_landmarks.landmark[i].x/.y/.visibility`, normalized 0–1 coordinates — so downstream code is detector-agnostic), `PoseSmoother` (boxcar smoothing that holds the last pose through short detection gaps), CoM, torso length, IoU, bounding boxes, `pose_bottom_y`, `base_alignment_tl`.
+- **`tracking.py`** — `PoseTracker`: owns both YOLO model handles and all detection/role logic (`detect_auto`, `detect_in_roi`, `reset`, `new_state`, `invalidate_role_ids`). Role state is a plain dict owned by the *caller*, so live playback and export passes keep independent states. Exposes `last_poses`/`last_ids`/`raw_base`/`raw_flyer` for drawing and click-to-assign.
+- **`stats.py`** — `LiveStats`: per-frame stats panel metrics; keeps the rolling CoM histories and returns formatted strings for the panel.
+- **`insights.py`** — post-run metrics DataFrame, rule-based coaching insights, Plotly report, LLM context summary, and `DeepSeekClient`.
+- **`main.py`** — `StuntCVApp`: Tkinter UI, playback loop, ROI/crop dragging, export dialogs, analysis orchestration, and the AI chat window. Should contain only UI concerns and glue — put new logic in the headless modules.
 
 ### Pose Model
 
-YOLOv8-pose (ultralytics) with **COCO 17 keypoints** — not MediaPipe's 33. Keypoint indices are named constants at the top of `main.py` (`KP_L_SHOULDER = 5`, etc.); `YOLO_CONNECTIONS` defines the drawn skeleton. The model file is hardcoded in `__init__` (`yolov8m-pose.pt`; swap to `yolov8n-pose.pt` for speed). There are **two model instances**: `self.yolo` runs auto mode through `.track()` (ByteTrack), and `self.yolo_roi` (lazy) does plain detection for ROI mode — they must stay separate because `.track()` registers tracker callbacks on the model's predictor, and per-crop detections would corrupt tracker state.
+YOLOv8-pose (ultralytics) with **COCO 17 keypoints** — not MediaPipe's 33. Keypoint indices are named constants in `pose_data.py` (`KP_L_SHOULDER = 5`, etc.); `YOLO_CONNECTIONS` defines the drawn skeleton. The model path is set where `PoseTracker` is constructed in `main.py` (`yolov8m-pose.pt`; swap to `yolov8n-pose.pt` for speed). `PoseTracker` keeps **two model instances**: the tracking model runs auto mode through `.track()` (ByteTrack), and a lazy second instance does plain detection for ROI mode — they must stay separate because `.track()` registers tracker callbacks on the model's predictor, and per-crop detections would corrupt tracker state.
 
 ### Core Data Flow (per frame)
 
 ```
 video_loop() → process_and_display_frame()
-    → find_poses_by_roi() OR find_poses_auto()   # detect + classify base/flyer
-    → smooth_pose()                               # temporal averaging via deque
-    → update_stats_panel()                        # velocity, wobble, alignment, score
+    → find_poses_by_roi() OR find_poses_auto()   # → PoseTracker.detect_in_roi / detect_auto
+    → PoseSmoother.smooth()                       # temporal averaging + gap hold
+    → update_stats_panel()                        # → LiveStats.update
     → draw_classified_poses()                     # base=red, flyer=blue, spotters=grey
     → display_all_frames()                        # render to 3 canvases
 ```
 
 ### Tracking Modes
 
-**Auto mode** (`find_poses_auto` → `_detect_poses_auto`): One `yolo.track(persist=True)` pass per frame gives every person a persistent ByteTrack ID. **Roles are sticky to track IDs**: on the first frame with 2+ people, `_best_stack_pair` picks flyer (person whose lowest point is highest in frame) and base (most horizontally aligned below); after that, roles just follow their IDs and are never silently reassigned by geometry. The track call uses `conf=0.1` (ByteTrack's second association stage needs low-confidence boxes to hold tracks through occlusion) and `iou=0.7` (so NMS doesn't merge the stacked pair); the UI confidence slider filters everyone *except* the boxes carrying the pair's track IDs. If a role's track dies for ≥5 frames, `_rebind_role` re-binds it to the unassigned track that best overlaps its last known box. "Who's higher" comparisons use `_pose_bottom_y` (ankles/hips max-y), not mean keypoint y — an occluded base with only shoulders visible would otherwise look like the highest person. Role inversion (flyer below base for 15 frames) only sets a passive UI warning (`role_hint_var`); it never auto-swaps.
+**Auto mode** (`PoseTracker.detect_auto`): One `yolo.track(persist=True)` pass per frame gives every person a persistent ByteTrack ID. **Roles are sticky to track IDs**: on the first frame with 2+ people, `_best_stack_pair` picks flyer (person whose lowest point is highest in frame) and base (most horizontally aligned below); after that, roles just follow their IDs and are never silently reassigned by geometry. The track call uses `conf=0.1` (ByteTrack's second association stage needs low-confidence boxes to hold tracks through occlusion) and `iou=0.7` (so NMS doesn't merge the stacked pair); the UI confidence threshold filters everyone *except* the boxes carrying the pair's track IDs. If a role's track dies for ≥5 frames, `_rebind_role` re-binds it to the unassigned track that best overlaps its last known box. "Who's higher" comparisons use `pose_bottom_y` (ankles/hips max-y), not mean keypoint y — an occluded base with only shoulders visible would otherwise look like the highest person. Role inversion (flyer below base for 15 frames) only sets a passive UI warning (`role_hint_var`, in `main.py`); it never auto-swaps.
 
-`_detect_poses_auto` takes a `state` dict (`_new_track_state()`: role→track-ID bindings, last known landmarks, miss counters) and mutates it, so the live path (`self.track_state`) and the save/export loops each keep their own. It also writes `_last_detected_poses` / `_last_detected_ids` / `_raw_base_pose` / `_raw_flyer_pose` on `self` for drawing and click-to-assign. ByteTrack state lives *inside* `self.yolo`, so exports call `_reset_tracker()` before re-processing and `_reset_tracker()` + `_invalidate_role_ids()` after — live playback then recovers its roles via the overlap re-bind.
+ByteTrack state lives *inside* the YOLO model, so export/analysis passes call `tracker.reset()` before re-processing and `_recover_live_tracking()` (reset + `invalidate_role_ids`) after — live playback then recovers its roles via the overlap re-bind.
 
-**ROI mode** (`find_poses_by_roi`): Crops to two user-defined boxes, runs plain detection (`self.yolo_roi`) on each crop (best detection only), then translates landmarks back to full-frame coordinates via `translate_landmarks()`.
+**ROI mode** (`PoseTracker.detect_in_roi`): Crops to two user-defined boxes, runs plain detection on each crop (best detection only), then translates landmarks back to full-frame coordinates.
 
 **Manual role correction**: "Swap Base/Flyer" button, and right-click on a person in the middle canvas → context menu to bind their track ID to a role (assigning the other role's person swaps the pair). Both clear the smoothers.
 
@@ -52,15 +54,15 @@ A single draggable yellow box (`detection_crop`) serves two independent toggles:
 
 ### Save Logic
 
-Saving video or CSV re-processes the entire video from scratch (not from cached frame data), with its own local `_new_track_state()` and `PoseSmoother`s, bracketed by tracker resets (see Auto mode above). Manual role corrections made during live playback are **not** carried into exports — the export re-runs the initialization heuristic. "Save CSV + Viz" additionally generates a Plotly HTML (CoM height, velocity, acceleration over time) next to the CSV.
+Saving video or CSV re-processes the entire video from scratch (not from cached frame data), with its own local `PoseTracker.new_state()` and `PoseSmoother`s, bracketed by tracker resets (see Auto mode above). Manual role corrections made during live playback are **not** carried into exports — the export re-runs the initialization heuristic. "Save CSV + Viz" additionally generates a Plotly HTML (CoM height, velocity, acceleration over time) next to the CSV.
 
 ### Stats Calculations
 
-All stats are normalized by **torso length** (`get_torso_length`, shoulder-to-hip pixel distance, unit "TL") to be camera-distance invariant.
+All stats are normalized by **torso length** (`pose_data.torso_length`, shoulder-to-hip pixel distance, unit "TL") to be camera-distance invariant.
 
 - **Velocity**: CoM displacement between frames / time_delta / torso length (TL/s).
 - **Wobble**: Mean std dev of CoM over a 15-frame history, / torso length.
-- **CoM** (`calculate_center_of_mass`): Unweighted average of torso/leg/arm keypoints with visibility > 0.5.
+- **CoM** (`pose_data.center_of_mass`): Unweighted average of torso/leg/arm keypoints with visibility > 0.5.
 - **Alignment** (base): Horizontal deviation across shoulder/hip/ankle stack.
 - **Plumb Line**: Horizontal offset between base and flyer CoMs.
 - **Stunt Score**: Weighted: flyer height 40%, flyer wobble 30%, plumb line 30%.
